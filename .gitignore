@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+build_new/
+dist/
+dist_new/
+*.spec
+*.db
+*.log
+*.sqlite3
+logs/
+.venv.invalid-*/
+.workbuddy/

@@ -1,0 +1,16 @@
+# Runtime: Excel workbook parsing
+openpyxl==3.1.5
+
+# Windows printing queue integration (CPython 3.11-3.13)
+pywin32==312; platform_system == "Windows"
+
+# Built-in direct printing engine: PDF rendering + image decoding
+PyMuPDF==2.1
+Pillow==13.0.0
+
+# UI automation print channel (open document -> print dialog -> driver properties -> print)
+pywinauto==0.6.9
+comtypes==1.5.0
+
+# Optional local EXE packaging tool (installed by the same one-click setup)
+pyinstaller==6.22.3; platform_system == "Windows"
