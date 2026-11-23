@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 if (-not (Test-Path ".venv\Scripts\python.exe")) { throw "Run setup_windows.ps1 first." }
@@ -12,6 +12,8 @@ $Work = "build_new"
 $Out = "dist_new"
 if (Test-Path $Work) { Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path $Out) { Remove-Item $Out -Recurse -Force -ErrorAction SilentlyContinue }
+# 全新克隆的仓库里没有 dist 目录（已被 .gitignore 忽略），不建目录最后一步拷贝会失败
+if (-not (Test-Path "dist")) { New-Item -ItemType Directory -Path "dist" -Force | Out-Null }
 
 & $Vpy -m PyInstaller --noconfirm --onefile --windowed `
   --name PrintCaseStudio `
@@ -34,4 +36,4 @@ if (Test-Path "dist\PrintCaseStudio.exe") {
 Copy-Item "$Out\PrintCaseStudio.exe" "dist\PrintCaseStudio.exe" -Force
 Remove-Item $Work, $Out -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "Built: dist\PrintCaseStudio.exe" -ForegroundColor Green
-Write-Host "Run dist\PrintCaseStudio.exe. Printing uses the built-in GDI engine plus Word/WPS COM; no external print tool is required."
+Write-Host "Run dist\PrintCaseStudio.exe. Printer attributes are set in the driver print preferences and read back for verification; documents are submitted through Word/WPS or the built-in renderer. No external print tool is required."

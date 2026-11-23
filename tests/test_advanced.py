@@ -11,7 +11,7 @@ from printcase.separator import build_separator_pdf
 from printcase.spooler import QueueJob
 from printcase.validator import validate_case
 
-from test_runner import FakeSpooler, fake_driver_writer
+from test_runner import FakeSpooler, fake_driver_applier
 
 
 def _make_case(tmp_path, **kwargs) -> PrintCase:
@@ -25,10 +25,9 @@ def test_mixed_paper_omits_paper_token_for_mixed_size_printing(tmp_path):
     pdf.write_bytes(b"%PDF")
     case = _make_case(tmp_path, paper="mixed", resolved_path=pdf)
     assert validate_case(case, {"Test Printer"}, "Test Printer") == []
-    # 混合尺寸：不写 DEVMODE PaperSize，由驱动按每页尺寸走纸
-    from printcase.driver_settings import devmode_updates_for_case
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case)}
-    assert "PaperSize" not in attrs
+    # 混合尺寸：驱动界面里不指定纸张尺寸，由驱动按每页尺寸走纸
+    from printcase.driver_ui import plan_actions
+    assert not [a for a in plan_actions(case) if a.label == "纸张尺寸"]
 
 
 def test_paper_auto_and_mixed_are_accepted(tmp_path):
@@ -153,7 +152,7 @@ class JobThenClearSpooler(FakeSpooler):
         return []
 
 
-def test_runner_prints_docx_directly_without_conversion(tmp_path):
+def test_runner_prints_docx_through_ui_automation_without_conversion(tmp_path):
     """docx 属于 COM 直打格式：直接把源文档交给打印端，不做 PDF 转换。"""
     docx = tmp_path / "报告.docx"
     docx.write_bytes(b"PK placeholder")
@@ -170,7 +169,7 @@ def test_runner_prints_docx_directly_without_conversion(tmp_path):
     case = PrintCase(case_id="TC-DOCX", enabled=True, file_path=str(docx), resolved_path=docx, printer="Test Printer")
     runner = PrintRunner(
         JobThenClearSpooler("报告.pdf"), AuditStore(tmp_path / "a1.sqlite3"),
-        queue_timeout=1, submitter=submit, driver_writer=fake_driver_writer(),
+        queue_timeout=1, ui_submitter=submit, driver_applier=fake_driver_applier(),
         document_converter=converter,
     )
     result = runner.run_cases([case], "Test Printer", "R1", lambda *_: None)[0]
@@ -194,7 +193,7 @@ def test_runner_reports_failure_when_conversion_is_unavailable(tmp_path):
     case = PrintCase(case_id="TC-NOCONV", enabled=True, file_path=str(pptx), resolved_path=pptx, printer="Test Printer")
     runner = PrintRunner(
         JobThenClearSpooler(), AuditStore(tmp_path / "a2.sqlite3"),
-        queue_timeout=1, driver_writer=fake_driver_writer(),
+        queue_timeout=1, driver_applier=fake_driver_applier(),
         document_converter=converter,
     )
     result = runner.run_cases([case], "Test Printer", "R2", lambda *_: None)[0]
@@ -215,7 +214,7 @@ def test_runner_prints_separator_pages_before_and_after(tmp_path):
         case_id="TC-SEP", enabled=True, file_path=str(pdf), resolved_path=pdf,
         printer="Test Printer", separator_page="both",
     )
-    runner = PrintRunner(JobThenClearSpooler(), AuditStore(tmp_path / "a3.sqlite3"), queue_timeout=1, submitter=submit, driver_writer=fake_driver_writer())
+    runner = PrintRunner(JobThenClearSpooler(), AuditStore(tmp_path / "a3.sqlite3"), queue_timeout=1, submitter=submit, driver_applier=fake_driver_applier())
     result = runner.run_cases([case], "Test Printer", "R3", lambda *_: None)[0]
     assert result.status == CaseStatus.QUEUE_CLEARED
     names = [c for c, _ in launched]
@@ -292,9 +291,8 @@ def test_mixed_sizes_switch_rules(tmp_path):
     # 开启混合尺寸 + 自动选纸盒：通过
     ok = _make_case(tmp_path, resolved_path=pdf, mixed_sizes="yes", paper="auto", bin="")
     assert validate_case(ok, {"Test Printer"}, "Test Printer") == []
-    from printcase.driver_settings import devmode_updates_for_case
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(ok)}
-    assert "PaperSize" not in attrs
+    from printcase.driver_ui import plan_actions
+    assert not [a for a in plan_actions(ok) if a.label == "纸张尺寸"]
 
     # 开启混合尺寸但指定了纸盒：拦截
     bad_bin = _make_case(tmp_path, resolved_path=pdf, mixed_sizes="yes", bin="纸盒2")
@@ -357,7 +355,7 @@ def test_runner_each_copy_prints_separator_between_copies(tmp_path):
     )
     runner = PrintRunner(
         JobThenClearSpooler(), AuditStore(tmp_path / "a4.sqlite3"),
-        queue_timeout=1, submitter=submit, driver_writer=fake_driver_writer(),
+        queue_timeout=1, submitter=submit, driver_applier=fake_driver_applier(),
     )
     result = runner.run_cases([case], "Test Printer", "R4", lambda *_: None)[0]
     assert result.status == CaseStatus.QUEUE_CLEARED
@@ -367,122 +365,60 @@ def test_runner_each_copy_prints_separator_between_copies(tmp_path):
     assert copies == [1, 1, 1, 1, 1]  # 主文档按单份逐个下发，分隔页作业固定为单份
 
 
-# ---------- 驱动 DEVMODE 写入（driver_settings） ----------
+# ---------- 驱动属性页操作计划（driver_ui.plan_actions） ----------
 
-class FakeDevMode:
-    def __init__(self):
-        self.Fields = 0x2            # 默认只有 DM_PAPERSIZE
-        self.Collate = 0
-        self.PrintQuality = 600
-        self.MediaType = 1
-        self.PaperSize = 9
-        self.PaperWidth = 0
-        self.PaperLength = 0
+def _action(actions, label):
+    return next((item for item in actions if item.label == label), None)
 
 
-class FakeWin32print:
-    DM_PAPERSIZE = 0x2
-    DM_PAPERWIDTH = 0x4
-    DM_PAPERLENGTH = 0x8
-    DM_PRINTQUALITY = 0x400
-    DM_COLLATE = 0x1000
-    DM_MEDIATYPE = 0x8000
-    DM_IN_BUFFER = 0x8
-    DM_OUT_BUFFER = 0x2
-    PRINTER_ALL_ACCESS = 0xF000C
-
-    def __init__(self):
-        self.dev = FakeDevMode()
-        self.set_calls = []
-
-    def OpenPrinter(self, name, access=None):
-        return 1
-
-    def ClosePrinter(self, handle):
-        pass
-
-    def GetPrinter(self, handle, level):
-        return {"pDevMode": self.dev}
-
-    def DocumentProperties(self, hwnd, handle, name, devmode_in, devmode_out, flags):
-        if devmode_in is None:
-            return self.dev
-        self.dev = devmode_in
-        return devmode_in
-
-    def SetPrinter(self, handle, level, info, command):
-        self.set_calls.append(info["pDevMode"])
-
-
-def test_devmode_updates_translation(tmp_path):
-    from printcase.driver_settings import devmode_updates_for_case
+def test_plan_actions_translation(tmp_path):
+    from printcase.driver_ui import plan_actions
 
     case = _make_case(tmp_path, collate="yes", print_quality="1200", media_type="普通纸(60-90gsm)")
-    updates = devmode_updates_for_case(case)
-    attrs = {attr: value for attr, _, value in updates}
-    assert attrs["Collate"] == 1
-    assert attrs["PrintQuality"] == 1200
-    assert attrs["MediaType"] == 1
+    actions = plan_actions(case)
+    assert _action(actions, "逐份").value is True
+    assert _action(actions, "逐份").expect_value == 1
+    assert _action(actions, "打印质量").value[0] == "1200 dpi"
+    assert _action(actions, "打印质量").expect_value == 1200
+    # 无驱动能力数据时按名称在下拉里选（驱动自己负责编码）
+    assert _action(actions, "纸张类型").kind == "combo_text"
+    assert _action(actions, "纸张类型").value == "普通纸(60-90gsm)"
 
     case2 = _make_case(tmp_path, media_type="铜版纸", print_quality="high")
-    attrs2 = {attr: value for attr, _, value in devmode_updates_for_case(case2)}
-    assert attrs2["PrintQuality"] == -4  # DMRES_HIGH
-    assert attrs2["MediaType"] == 2      # 铜版纸 → DMMEDIA_GLOSSY
-
-    # 驱动私有介质（如“厚纸2”）在无驱动能力数据时 → 记入 errors，由调用方拦截用例
-    errs: list[str] = []
-    attrs3 = {attr: value for attr, _, value in devmode_updates_for_case(_make_case(tmp_path, media_type="厚纸2(158-209gsm)"), errors=errs)}
-    assert "MediaType" not in attrs3
-    assert any("厚纸2" in e for e in errs)
-
-    # 驱动私有介质代号可用数字直接指定
-    attrs4 = {attr: value for attr, _, value in devmode_updates_for_case(_make_case(tmp_path, media_type="205"))}
-    assert attrs4["MediaType"] == 205
-
-    # 有驱动能力数据时按驱动名称解析出真实介质代号
-    caps = {"media_names": ["普通纸", "厚纸2"], "media_ids": [1, 205]}
-    attrs5 = {attr: value for attr, _, value in devmode_updates_for_case(_make_case(tmp_path, media_type="厚纸2"), caps=caps)}
-    assert attrs5["MediaType"] == 205
+    actions2 = plan_actions(case2)
+    assert _action(actions2, "纸张类型").value == "铜版纸"
+    assert _action(actions2, "打印质量").value[0] == "high"
 
 
-def test_apply_case_to_driver_writes_and_restores(tmp_path):
-    from printcase.driver_settings import apply_case_to_driver
+def test_plan_actions_uses_driver_order_for_private_media(tmp_path):
+    from printcase.driver_ui import plan_actions
 
-    w = FakeWin32print()
-    before = (w.dev.Collate, w.dev.PrintQuality, w.dev.MediaType, w.dev.Fields)
-    logs = []
-    case = _make_case(tmp_path, collate="yes", print_quality="1200", media_type="铜版纸")
-    restore = apply_case_to_driver("Test Printer", case, log=logs.append, win32module=w)
-    assert w.dev.Collate == 1
-    assert w.dev.PrintQuality == 1200
-    assert w.dev.MediaType == 2  # 铜版纸 → DMMEDIA_GLOSSY
-    assert len(w.set_calls) == 1
-    assert any("DEVMODE" in m for m in logs)
-
-    restore()
-    assert (w.dev.Collate, w.dev.PrintQuality, w.dev.MediaType) == before[:3]
-    assert len(w.set_calls) == 2
+    # 驱动上报的私有介质代号不可靠，但下拉顺序稳定：按序号设置即可
+    caps = {"media_names": ["普通纸(60-90gsm)", "厚纸1(106-120gsm)", "厚纸1+(121-157gsm)"]}
+    case = _make_case(tmp_path, media_type="厚纸1+(121-157gsm)")
+    action = _action(plan_actions(case, caps), "纸张类型")
+    assert action.kind == "combo_index"
+    assert action.value == 2
+    # 私有介质没有可预期的标准代号：只要求回读值发生变化
+    assert action.expect_field == "MediaType" and action.expect_value is None
 
 
-def test_devmode_unsupported_field_raises(tmp_path):
-    from printcase.driver_settings import DriverSettingsError, apply_case_to_driver
+def test_verify_reports_media_unchanged(tmp_path, monkeypatch):
+    from printcase import driver_ui
 
-    class NoMediaTypeWin32(FakeWin32print):
-        def DocumentProperties(self, hwnd, handle, name, devmode_in, devmode_out, flags):
-            if devmode_in is None:
-                return self.dev
-            if flags & self.DM_IN_BUFFER:  # 合并（校验）调用：驱动拒绝 MEDIATYPE 字段
-                devmode_in.Fields &= ~self.DM_MEDIATYPE
-            self.dev = devmode_in
-            return devmode_in
+    snapshots = [{"MediaType": 266, "PaperSize": 9}, {"MediaType": 266, "PaperSize": 9}]
+    monkeypatch.setattr(driver_ui, "snapshot", lambda printer, w=None: snapshots.pop(0))
+    actions = [driver_ui.Action("纸张", "纸张类型", "combo_index", 3, "MediaType")]
+    problems = driver_ui.verify("Test Printer", actions, {"MediaType": 266, "PaperSize": 9})
+    assert problems and "纸张类型" in problems[0]
 
-    case = _make_case(tmp_path, media_type="普通纸")
-    try:
-        apply_case_to_driver("Test Printer", case, win32module=NoMediaTypeWin32())
-    except DriverSettingsError as exc:
-        assert "MediaType" in str(exc)
-    else:
-        raise AssertionError("驱动拒绝字段时应抛出 DriverSettingsError")
+
+def test_verify_accepts_driver_private_media_code(tmp_path, monkeypatch):
+    from printcase import driver_ui
+
+    monkeypatch.setattr(driver_ui, "snapshot", lambda printer, w=None: {"MediaType": 263, "PaperSize": 9})
+    actions = [driver_ui.Action("纸张", "纸张类型", "combo_index", 3, "MediaType")]
+    assert driver_ui.verify("Test Printer", actions, {"MediaType": 266, "PaperSize": 9}) == []
 
 
 def test_extended_office_formats_are_accepted(tmp_path):
@@ -632,16 +568,17 @@ def test_paper_labels_normalize_to_driver_tokens():
         assert normalize_paper(label) == token
 
 
-def test_driver_specific_paper_uses_devmode(tmp_path):
+def test_driver_specific_paper_uses_driver_order(tmp_path):
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"%PDF")
     case = _make_case(tmp_path, resolved_path=pdf, paper="SRA3 (320 x 450mm)")
     assert validate_case(case, {"Test Printer"}, "Test Printer") == []
-    from printcase.driver_settings import devmode_updates_for_case
-    # 驱动上报 SRA3 代号 → PaperSize 写入 DEVMODE
+    from printcase.driver_ui import plan_actions
+    # 专有尺寸按驱动上报顺序在界面里选中，并用驱动代号回读校验
     caps = {"papers": ["SRA3 (320 x 450mm)"], "paper_ids": [130]}
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case, caps=caps)}
-    assert attrs["PaperSize"] == 130
+    action = _action(plan_actions(case, caps), "纸张尺寸")
+    assert action.kind == "combo_index" and action.value == 0
+    assert action.expect_value == 130
 
 
 def test_named_tray_and_auto_source(tmp_path):
@@ -649,10 +586,11 @@ def test_named_tray_and_auto_source(tmp_path):
     pdf.write_bytes(b"%PDF")
     case = _make_case(tmp_path, resolved_path=pdf, bin="纸盒1")
     assert validate_case(case, {"Test Printer"}, "Test Printer") == []
-    from printcase.driver_settings import devmode_updates_for_case
+    from printcase.driver_ui import plan_actions
     caps = {"bin_names": ["自动选择", "纸盒1"], "bin_ids": [7, 1]}
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case, caps=caps)}
-    assert attrs["DefaultSource"] == 1  # 名称类纸盒走 DEVMODE DefaultSource
+    action = _action(plan_actions(case, caps), "纸张来源")
+    assert action.kind == "combo_index" and action.value == 1
+    assert action.expect_value == 1
     assert "纸盒:纸盒1" in case.settings_summary()
 
 
@@ -673,8 +611,8 @@ def test_separator_source_requires_separator(tmp_path):
     assert any("灰化" in e for e in validate_case(case, {"Test Printer"}, "Test Printer"))
 
 
-def test_devmode_resolves_paper_and_tray_from_driver_caps(tmp_path):
-    from printcase.driver_settings import devmode_updates_for_case
+def test_plan_resolves_paper_and_tray_from_driver_caps(tmp_path):
+    from printcase.driver_ui import plan_actions
 
     caps = {
         "papers": ["A4 (210 x 297mm)", "SRA3 (320 x 450mm)"],
@@ -683,9 +621,11 @@ def test_devmode_resolves_paper_and_tray_from_driver_caps(tmp_path):
         "bin_ids": [7, 4, 1],
     }
     case = _make_case(tmp_path, paper="SRA3 (320 x 450mm)", bin="纸盒1")
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case, caps=caps)}
-    assert attrs["PaperSize"] == 130
-    assert attrs["DefaultSource"] == 1
+    actions = plan_actions(case, caps)
+    assert _action(actions, "纸张尺寸").value == 1
+    assert _action(actions, "纸张尺寸").expect_value == 130
+    assert _action(actions, "纸张来源").value == 2
+    assert _action(actions, "纸张来源").expect_value == 1
 
 
 def test_template_matches_driver_dropdown_options():
@@ -792,42 +732,38 @@ def test_word_falls_back_to_wps_then_reports(tmp_path):
 
 # ---------- 属性生效保证（严格模式） ----------
 
-class RevertingWin32print(FakeWin32print):
-    """模拟驱动接受写入但内部改回默认值的场景（回读不一致）。"""
-    def SetPrinter(self, handle, level, info, command):
-        super().SetPrinter(handle, level, info, command)
-        self.dev.MediaType = 1  # 驱动悄悄还原
+def test_driver_ui_verify_blocks_when_driver_ignores_value(monkeypatch):
+    """驱动回读值与用例要求不一致时，用例必须被拦截（不下发）。"""
+    from printcase import driver_ui
+
+    monkeypatch.setattr(driver_ui, "snapshot", lambda printer, w=None: {"PrintQuality": 600, "PaperSize": 9, "MediaType": 266})
+    actions = [driver_ui.Action("基本", "打印质量", "radio", ("1200 dpi", "1200"), "PrintQuality", 1200)]
+    problems = driver_ui.verify("Test Printer", actions, {"PrintQuality": 600, "PaperSize": 9, "MediaType": 266})
+    assert any("PrintQuality" in item for item in problems)
 
 
-def test_apply_raises_when_driver_reverts_quality_value(tmp_path):
-    """非介质字段被驱动改写时必须严格拦截（介质类型允许归一化为驱动私有编码）。"""
-    from printcase.driver_settings import DriverSettingsError, apply_case_to_driver
-
-    class RevertingQuality(FakeWin32print):
-        def SetPrinter(self, handle, level, info, command):
-            super().SetPrinter(handle, level, info, command)
-            self.dev.PrintQuality = 600  # 驱动把 1200 悄悄改回 600
-
-    case = _make_case(tmp_path, print_quality="1200")
-    try:
-        apply_case_to_driver("Test Printer", case, win32module=RevertingQuality())
-    except DriverSettingsError as exc:
-        assert "回读不一致" in str(exc) and "PrintQuality" in str(exc)
-    else:
-        raise AssertionError("驱动回读不一致时应抛出 DriverSettingsError")
-
-
-def test_unresolvable_media_blocks_case_in_preflight():
+def test_unreported_media_blocks_case_in_preflight():
     from printcase.capabilities import validate_driver_capabilities
     from printcase.models import PrintCase
 
-    case = PrintCase(case_id="T", enabled=True, file_path="x.pdf", media_type="厚纸2(158-209gsm)")
-    caps = {"papers": None, "media_names": None, "media_ids": None}
+    case = PrintCase(case_id="T", enabled=True, file_path="x.pdf", media_type="厚纸9(300-350gsm)")
+    caps = {"papers": None, "media_names": ["普通纸(60-90gsm)", "厚纸2(158-209gsm)"]}
     errors = validate_driver_capabilities(case, caps)
-    assert any("厚纸2" in e and "驱动能力检查" in e for e in errors), errors
+    assert any("厚纸9" in e and "驱动能力检查" in e for e in errors), errors
 
 
-def test_runner_blocks_case_when_media_unresolvable(tmp_path):
+def test_private_media_reported_by_driver_passes_preflight():
+    """Pantum 私有介质（厚纸1+）由驱动上报 → 不再被拦截。"""
+    from printcase.capabilities import validate_driver_capabilities
+    from printcase.models import PrintCase
+
+    case = PrintCase(case_id="TC-003", enabled=True, file_path="x.pdf", media_type="厚纸1+(121-157gsm)")
+    caps = {"papers": [], "media_names": ["普通纸(60-90gsm)", "厚纸1(106-120gsm)", "厚纸1+(121-157gsm)"]}
+    assert validate_driver_capabilities(case, caps) == []
+
+
+def test_runner_blocks_case_when_driver_ui_rejects(tmp_path):
+    from printcase.driver_ui import DriverUiError
     from printcase.models import PrintCase
     from printcase.runner import PrintRunner
 
@@ -837,30 +773,32 @@ def test_runner_blocks_case_when_media_unresolvable(tmp_path):
     def submit(*_args, **_kwargs):
         raise AssertionError("属性无法保证生效时不应下发打印")
 
+    def rejecting_applier(printer, case, log=None, caps=None):
+        raise DriverUiError("纸张类型“厚纸1+(121-157gsm)”在驱动界面里找不到")
+
     case = PrintCase(
         case_id="TC-MEDIA", enabled=True, file_path=str(pdf), resolved_path=pdf,
-        printer="Test Printer", media_type="厚纸2(158-209gsm)",
+        printer="Test Printer", media_type="厚纸1+(121-157gsm)",
     )
     runner = PrintRunner(
         JobThenClearSpooler(), AuditStore(tmp_path / "a5.sqlite3"),
-        queue_timeout=1, submitter=submit, document_converter=lambda *a, **k: (_ for _ in ()).throw(AssertionError("无文档转换")),
+        queue_timeout=1, submitter=submit, driver_applier=rejecting_applier,
+        document_converter=lambda *a, **k: (_ for _ in ()).throw(AssertionError("无文档转换")),
     )
     result = runner.run_cases([case], "Test Printer", "R5", lambda *_: None)[0]
     assert result.status == CaseStatus.FAILED
     assert "本次不下发" in result.message
-    assert "厚纸2" in result.message
+    assert "厚纸1+" in result.message
 
 
-def test_media_resolution_matches_driver_name_with_full_label(tmp_path):
-    from printcase.driver_settings import devmode_updates_for_case
+def test_plan_matches_driver_name_with_full_label(tmp_path):
+    from printcase.driver_ui import plan_actions
 
-    # 驱动上报“厚纸2”，用例填完整标签“厚纸2(158-209gsm)” → 双向包含匹配
-    caps = {"media_names": ["自动选择", "普通纸", "厚纸2"], "media_ids": [1, 201, 205]}
+    # 驱动上报带克重的完整名称，用例填完整标签 → 精确落在同一下拉项
+    caps = {"media_names": ["自动选择", "普通纸", "厚纸2(158-209gsm)"]}
     case = _make_case(tmp_path, media_type="厚纸2(158-209gsm)")
-    errs: list[str] = []
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case, caps=caps, errors=errs)}
-    assert errs == []
-    assert attrs["MediaType"] == 205
+    action = _action(plan_actions(case, caps), "纸张类型")
+    assert action.kind == "combo_index" and action.value == 2
 
 
 # ---------- 内置直打引擎（GDI / Office COM） ----------

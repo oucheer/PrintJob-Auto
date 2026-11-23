@@ -22,15 +22,17 @@ def test_page_selection_parsing():
     assert page_order([0, 1], 1, "no") == [0, 1]
 
 
-def test_all_explicit_paper_sizes_resolve_to_devmode():
-    """直打链路下所有显式纸张尺寸都必须能解析出 DEVMODE 代号。"""
-    from printcase.driver_settings import devmode_updates_for_case
+def test_all_explicit_paper_sizes_resolve_to_driver_order():
+    """所有显式纸张尺寸都必须能在驱动界面上定位到具体选项。"""
+    from printcase.driver_ui import plan_actions
 
+    caps = {"papers": ["A4 (210 x 297mm)"], "paper_ids": [9]}
     case = PrintCase(case_id="TC-01", enabled=True, file_path="a.pdf", paper="A4", print_quality="600", collate="yes")
-    attrs = {attr: value for attr, _, value in devmode_updates_for_case(case)}
-    assert attrs["PaperSize"] == 9
-    assert attrs["PrintQuality"] == 600
-    assert attrs["Collate"] == 1
+    actions = {item.label: item for item in plan_actions(case, caps)}
+    assert actions["纸张尺寸"].value == 0
+    assert actions["纸张尺寸"].expect_value == 9      # 驱动自报的 DMPAPER 代号，用于回读校验
+    assert actions["打印质量"].expect_value == 600
+    assert actions["逐份"].expect_value == 1
 
 
 def test_excel_reader_supports_chinese_headers_and_relative_paths(tmp_path):

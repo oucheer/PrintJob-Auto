@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import queue
 import threading
@@ -56,30 +55,15 @@ class PrintCaseApp:
         self.printer: WindowsSpooler | None = None
         self.runner: PrintRunner | None = None
         self.event_queue: queue.Queue = queue.Queue()
-        self.ui_check_seq = 0
         self.worker: threading.Thread | None = None
         self.running = False
         self.audit = AuditStore(data_dir() / "history.sqlite3")
-        self.config_path = data_dir() / "config.json"
-        self.config = self._read_config()
 
         self._setup_style()
         self._build_ui()
         self._refresh_environment()
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        if self.config.get("print_mode") == "ui":
-            # 上次用的是 UI 自动化：启动后就自检一次，状态栏直接显示引擎是否就绪
-            self.root.after(200, self._on_mode_changed)
-
-    def _read_config(self) -> dict:
-        try:
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _write_config(self) -> None:
-        self.config_path.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _setup_style(self) -> None:
         style = ttk.Style()
@@ -124,35 +108,6 @@ class PrintCaseApp:
         ("message", "结果 / 诊断", 230, "w"),
     ]
 
-    # 用例队列表格列（与 Excel 用例表逐列对应，最左为勾选列）
-    TREE_COLUMNS = [
-        ("check", "选", 34, "center"),
-        ("case_id", "用例 ID", 92, "w"),
-        ("file", "打印文件", 150, "w"),
-        ("pages", "页码", 62, "w"),
-        ("copies", "份数", 48, "center"),
-        ("paper", "纸张尺寸", 132, "w"),
-        ("mixed", "混合尺寸", 62, "center"),
-        ("orientation", "方向", 52, "center"),
-        ("color", "颜色", 52, "center"),
-        ("duplex", "单双面", 70, "center"),
-        ("bin", "纸盒", 84, "w"),
-        ("collate", "打印顺序", 66, "center"),
-        ("quality", "打印质量", 66, "center"),
-        ("media", "纸张类型", 128, "w"),
-        ("skip_blank", "跳过空白页", 68, "center"),
-        ("borderless", "无边距", 52, "center"),
-        ("separator", "分隔页", 62, "center"),
-        ("sep_bin", "分隔页来源", 84, "w"),
-        ("binding_loc", "装订位置", 68, "center"),
-        ("binding_method", "装订方式", 68, "center"),
-        ("ext_attrs", "扩展属性", 72, "center"),
-        ("status", "执行状态", 148, "w"),
-        ("time", "耗时", 56, "w"),
-        ("message", "结果 / 诊断", 230, "w"),
-    ]
-    MODE_LABELS = {"direct": "直接驱动（推荐）", "ui": "UI 自动化（pywinauto）"}
-    MODE_BY_LABELS = {"直接驱动（推荐）": "direct", "UI 自动化（pywinauto）": "ui"}
 
     NAV_ITEMS = [
         ("console", "🖨", "打印执行"),
@@ -269,12 +224,9 @@ class PrintCaseApp:
         self.printer_combo = ttk.Combobox(toolbar, textvariable=self.printer_var, width=24, state="readonly")
         self.printer_combo.pack(side="left", padx=(6, 6), pady=8)
         ttk.Button(toolbar, text="刷新", command=self._refresh_printers).pack(side="left")
-        tk.Label(toolbar, text="下发方式", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(14, 2), pady=8)
-        self.mode_var = tk.StringVar(value=self.MODE_LABELS.get(self.config.get("print_mode", "direct"), self.MODE_LABELS["direct"]))
-        self.mode_combo = ttk.Combobox(toolbar, textvariable=self.mode_var, width=22, state="readonly",
-                                       values=[self.MODE_LABELS["direct"], self.MODE_LABELS["ui"]])
-        self.mode_combo.pack(side="left", padx=(4, 2), pady=8)
-        self.mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_mode_changed())
+        self.driver_label = tk.Label(toolbar, text="驱动属性页：未自检", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 8))
+        self.driver_label.pack(side="left", padx=(12, 0), pady=8)
+        ttk.Button(toolbar, text="自检驱动属性页", command=self._check_driver_ui).pack(side="left", padx=(8, 0))
 
         # 用例队列占满整页宽度
         left = body
@@ -434,50 +386,42 @@ class PrintCaseApp:
         else:
             self.engine_label.configure(text=f"打印引擎：{detail}", bg="#7F3030", fg="#FFE6E6")
 
-    def _on_mode_changed(self) -> None:
-        label = self.mode_var.get()
-        mode = self.MODE_BY_LABELS.get(label, "direct")
-        self.config["print_mode"] = mode
-        self._write_config()
-        if mode == "ui":
-            self._log("下发方式已切换为 UI 自动化：软件将通过 pywinauto 打开文档、调出打印对话框、选择驱动并设置属性后点击打印。")
-            self.status_var.set("下发方式：UI 自动化（pywinauto）· 正在自检引擎…")
-            self.ui_check_seq = getattr(self, "ui_check_seq", 0) + 1
-            seq = self.ui_check_seq
-
-            def probe() -> None:
-                try:
-                    from .ui_print import ui_engine_available
-
-                    ok, detail = ui_engine_available()
-                except Exception as exc:  # noqa: WPS421
-                    ok, detail = False, f"自检异常：{type(exc).__name__}: {exc}"
-                self.event_queue.put(("ui_check", (seq, ok, detail)))
-
-            threading.Thread(target=probe, name="ui-engine-check", daemon=True).start()
-        else:
-            self._log("下发方式已切换为直接驱动：内置 GDI + Word/WPS COM 直打。")
-            self.status_var.set("下发方式：直接驱动")
-
-    def _apply_ui_check(self, seq: int, ok: bool, detail: str) -> None:
-        """UI 引擎自检结果回到主线程后再更新界面（自检本身在后台线程跑）。"""
-        if seq != getattr(self, "ui_check_seq", 0):
-            return  # 已经切到别的下发方式，丢弃过期结果
-        if ok:
-            self._log(f"UI 自动化引擎自检通过：{detail}")
-            self.status_var.set(f"下发方式：UI 自动化 · {detail}")
+    def _check_driver_ui(self) -> None:
+        """自检：当前默认打印机的驱动“打印首选项”能否被自动打开（不修改任何设置）。"""
+        printer = self.printer_var.get().strip()
+        if not printer:
+            messagebox.showinfo("未选择打印机", "请先选择默认打印机。")
             return
-        self._log(f"UI 自动化引擎自检未通过：{detail}")
-        self.status_var.set("下发方式：UI 自动化（引擎自检失败）")
+        self.driver_label.configure(text="驱动属性页：自检中…", fg=MUTED)
+        self.status_var.set(f"正在自检 {printer} 的驱动属性页…")
+
+        def probe() -> None:
+            try:
+                from .driver_ui import available
+
+                ok, detail = available(printer)
+            except Exception as exc:  # noqa: WPS421
+                ok, detail = False, f"自检异常：{type(exc).__name__}: {exc}"
+            self.event_queue.put(("driver_check", (ok, detail)))
+
+        threading.Thread(target=probe, name="driver-ui-check", daemon=True).start()
+
+    def _apply_driver_check(self, ok: bool, detail: str) -> None:
+        if ok:
+            self.driver_label.configure(text=f"驱动属性页：{detail}", fg=GREEN)
+            self.status_var.set(f"驱动属性页自检通过 · {detail}")
+            self._log(f"驱动属性页自检通过：{detail}")
+            return
+        self.driver_label.configure(text="驱动属性页：不可用", fg=RED)
+        self.status_var.set("驱动属性页自检未通过")
+        self._log(f"驱动属性页自检未通过：{detail}")
         messagebox.showwarning(
-            "UI 自动化不可用",
+            "驱动属性页不可用",
             f"{detail}\n\n"
-            "这属于本机 COM 组件状态问题，与“选择哪个驱动”无关。\n"
-            "可先改用“直接驱动”下发，或关闭 Word/WPS 后重新切换一次。",
+            "本软件通过驱动自己的“打印首选项”设置纸张/介质等属性；"
+            "打不开属性页时这些用例会被判定失败且不下发。\n"
+            "请确认驱动已正确安装，并能手工打开“打印首选项”。",
         )
-        self.mode_var.set(self.MODE_LABELS["direct"])
-        self.config["print_mode"] = "direct"
-        self._write_config()
 
     def _refresh_printers(self) -> None:
         try:
@@ -486,8 +430,13 @@ class PrintCaseApp:
             names = self.printer.list_printers()
             self.printer_combo["values"] = names
             current = self.printer_var.get()
-            if current not in names and names:
-                self.printer_var.set(names[0])
+            if current not in names:
+                # 优先选中 Windows 默认打印机，避免默认落到“Fax/PDF”这类虚拟打印机
+                try:
+                    default_printer = self.printer.win32print.GetDefaultPrinter()
+                except Exception:  # noqa: WPS420
+                    default_printer = ""
+                self.printer_var.set(default_printer if default_printer in names else (names[0] if names else ""))
             self.env_label.configure(text=f"Windows 打印服务可用 · {len(names)} 台打印机", fg="#DDF4E8", bg="#1D654B")
             if not names:
                 self._log("系统未发现本地或已连接打印机。")
@@ -732,10 +681,7 @@ class PrintCaseApp:
 
         self.run_id = uuid.uuid4().hex[:12].upper()
         self.run_results = list(preflight_results)
-        mode = self.MODE_BY_LABELS.get(self.mode_var.get(), "direct")
-        self.config["print_mode"] = mode
-        self._write_config()
-        self.runner = PrintRunner(self.printer, self.audit, mode=mode)
+        self.runner = PrintRunner(self.printer, self.audit)
         self.running = True
         self._set_running_ui(True)
         self.status_var.set(f"执行中 · RUN {self.run_id}")
@@ -778,8 +724,8 @@ class PrintCaseApp:
                         self.run_results.append(payload)
                     self._render_cases()
                     self._update_kpis()
-                elif kind == "ui_check":
-                    self._apply_ui_check(*payload)
+                elif kind == "driver_check":
+                    self._apply_driver_check(*payload)
                 elif kind == "finished":
                     self.running = False
                     self._set_running_ui(False)

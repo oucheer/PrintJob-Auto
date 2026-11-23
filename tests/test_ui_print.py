@@ -325,43 +325,39 @@ def test_ui_print_rejects_non_document_formats(tmp_path):
     assert "GDI" in str(excinfo.value)
 
 
-def test_ui_mode_routes_documents_to_ui_and_pdf_to_direct(tmp_path):
-    """runner 在 UI 模式下：docx 走 UI 自动化；PDF 自动回落内置直打。"""
+def test_default_channel_routes_documents_to_ui_and_other_formats_to_renderer(tmp_path, monkeypatch):
+    """统一通道：Office 文档走 UI 自动化；PDF/图片由内置渲染器送入队列。"""
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from test_runner import FakeSpooler, fake_driver_writer  # noqa: WPS433
+    from test_runner import FakeSpooler  # noqa: WPS433
 
+    from printcase import runner as runner_module
     from printcase.audit import AuditStore
     from printcase.runner import PrintRunner
 
     calls = []
 
-    def ui_submit(printer, case, source_path, log, temp_dir):
+    def fake_ui(printer, case, source_path, log, timeout=90, **kwargs):
         calls.append(("ui", Path(source_path).suffix))
         return "ui-automation", Path(source_path).stem
 
-    def direct_submit(printer, case, source_path, log, temp_dir):
-        calls.append(("direct", Path(source_path).suffix))
+    def fake_driver(printer, case, source_path, log, **kwargs):
+        calls.append(("renderer", Path(source_path).suffix))
         return "gdi-pdf", Path(source_path).stem
 
-    runner = PrintRunner(
-        FakeSpooler(), AuditStore(tmp_path / "ui.sqlite3"), queue_timeout=1,
-        submitter=direct_submit, driver_writer=fake_driver_writer(),
-        mode="ui", ui_submitter=ui_submit,
-    )
+    monkeypatch.setattr(runner_module, "print_with_ui", fake_ui)
+    monkeypatch.setattr(runner_module, "print_with_driver", fake_driver)
 
+    runner = PrintRunner(FakeSpooler(), AuditStore(tmp_path / "ui.sqlite3"))
     docx = tmp_path / "报告.docx"
     docx.write_bytes(b"PK")
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF")
+
     doc_case = PrintCase(case_id="TC-DOC", enabled=True, file_path=str(docx), resolved_path=docx, printer="Test Printer")
     pdf_case = PrintCase(case_id="TC-PDF", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
 
-    # 直接调用子流程的下发选择，避免真实队列等待
-    for case in (doc_case, pdf_case):
-        submit = runner.ui_submitter if runner.mode == "ui" else runner.submit
-        if Path(case.resolved_path).suffix.lower() not in {".docx", ".doc", ".rtf", ".odt", ".wps", ".wpt"}:
-            submit = runner.submit
-        submit("Test Printer", case, case.resolved_path, lambda _t: None, tmp_path)
+    runner._default_ui_submit("Test Printer", doc_case, docx, lambda _t: None, tmp_path)
+    runner._default_ui_submit("Test Printer", pdf_case, pdf, lambda _t: None, tmp_path)
 
-    assert calls == [("ui", ".docx"), ("direct", ".pdf")]
+    assert calls == [("ui", ".docx"), ("renderer", ".pdf")]

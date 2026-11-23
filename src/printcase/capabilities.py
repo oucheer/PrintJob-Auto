@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import re
 
-from .driver_settings import devmode_updates_for_case
 from .models import PrintCase
 from .validator import normalize_paper
 
 
 def _norm(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", str(value).casefold())
+
+
+def _media_reported(media: str, names: list[str] | None) -> bool:
+    """驱动是否上报了该纸张类型（名称可比克重后缀宽松匹配）。"""
+    if not names:
+        return True
+    wanted = _norm(media)
+    if not wanted:
+        return True
+    for name in names:
+        normalized = _norm(name)
+        if normalized and (normalized == wanted or wanted in normalized or normalized in wanted):
+            return True
+    return False
 
 
 def validate_driver_capabilities(case: PrintCase, caps: dict | None) -> list[str]:
-    """Validate standard options only when Windows reports capability data."""
+    """只核验驱动是否具备用例要求的选项（属性本身由驱动属性页设置）。"""
     if not caps:
         return []
     errors: list[str] = []
@@ -38,8 +51,10 @@ def validate_driver_capabilities(case: PrintCase, caps: dict | None) -> list[str
             if not name_match and not id_match:
                 known = ", ".join(bin_names or []) or ", ".join(str(x) for x in (bin_ids or []))
                 errors.append(f"驱动能力检查：未发现纸盒/进纸器 {wanted}（可用：{known or '驱动未提供列表'}）")
-    # 属性可保证性：显式填写但驱动无法解析代号的属性会静默失效，必须在检查阶段拦截
-    guarantee_errors: list[str] = []
-    devmode_updates_for_case(case, caps=caps, errors=guarantee_errors)
-    errors.extend(f"驱动能力检查：{msg}" for msg in guarantee_errors)
+    media = str(case.media_type or "").strip()
+    if media and not media.isdigit() and not _media_reported(media, caps.get("media_names")):
+        available = "、".join((caps.get("media_names") or [])[:8])
+        errors.append(
+            f"驱动能力检查：打印机未报告纸张类型“{media}”（驱动可用：{available or '驱动未提供列表'}）"
+        )
     return errors

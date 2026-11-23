@@ -1,9 +1,10 @@
 """端到端冒烟：真实下发打印作业，验证整条链路（可接受失败，重点是流程跑通）。
 
 用法：
-    .venv/Scripts/python.exe tools/smoke_e2e.py --mode direct
-    .venv/Scripts/python.exe tools/smoke_e2e.py --mode ui
-    .venv/Scripts/python.exe tools/smoke_e2e.py --mode ui --attr "逆序(0或1)=1"
+    .venv/Scripts/python.exe tools/smoke_e2e.py
+    .venv/Scripts/python.exe tools/smoke_e2e.py --media "厚纸1+(121-157gsm)"
+    .venv/Scripts/python.exe tools/smoke_e2e.py --file templates/docs/A4-check.pdf
+    .venv/Scripts/python.exe tools/smoke_e2e.py --attr "逆序(0或1)=1"
 
 说明：
 - 打印机会收到真实作业（1 份、1–2 页），请确认连的是测试机/测试打印机。
@@ -64,8 +65,10 @@ def parse_attr(text: str) -> ExtendedAttr:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("direct", "ui"), default="direct")
     parser.add_argument("--printer", default="")
+    parser.add_argument("--file", default="", help="打印源文件；缺省用 Word 生成两页 docx")
+    parser.add_argument("--paper", default="A4 (210 x 297mm)")
+    parser.add_argument("--media", default="", help='纸张类型，如 "厚纸1+(121-157gsm)"')
     parser.add_argument("--attr", action="append", default=[], help='扩展属性，如 "逆序(0或1)=1"')
     parser.add_argument("--copies", type=int, default=1)
     parser.add_argument("--to-file", default="", help="打印到文件（验证用，配合 Microsoft Print to PDF）")
@@ -88,26 +91,24 @@ def main() -> int:
         return 2
 
     temp_dir = Path(tempfile.mkdtemp(prefix="printcase_smoke_"))
-    if args.mode == "ui":
-        source = ensure_docx(temp_dir / "smoke-test.docx")
-        case = PrintCase(
-            case_id="SMOKE-UI", enabled=True, file_path=str(source), resolved_path=source,
-            printer=printer, copies=args.copies, paper="A4 (210 x 297mm)",
-            media_type="普通纸(60-90gsm)", duplex="simplex", print_quality="600",
-        )
+    if args.file:
+        source = Path(args.file)
+        if not source.is_absolute():
+            source = (ROOT / source).resolve()
     else:
-        source = ROOT / "templates" / "docs" / "A4-check.pdf"
-        case = PrintCase(
-            case_id="SMOKE-DIRECT", enabled=True, file_path=str(source), resolved_path=source,
-            printer=printer, copies=args.copies, paper="A4", duplex="simplex", print_quality="600",
-        )
+        source = ensure_docx(temp_dir / "smoke-test.docx")
+    case = PrintCase(
+        case_id="SMOKE", enabled=True, file_path=str(source), resolved_path=source,
+        printer=printer, copies=args.copies, paper=args.paper,
+        media_type=args.media, duplex="simplex", print_quality="600",
+    )
     case.extended_attrs = [parse_attr(item) for item in args.attr]
 
     before = {job.job_id for job in spooler.get_jobs(printer)}
     print(f"=== 冒烟开始 {datetime.now():%H:%M:%S} ===")
     print(f"打印机   : {printer}")
-    print(f"下发方式 : {args.mode}")
     print(f"源文件   : {source}")
+    print(f"纸张类型 : {args.media or '驱动默认'}")
     print(f"扩展属性 : {[attr.describe() for attr in case.extended_attrs] or '无'}")
     print(f"队列作业数（下发前）: {len(before)}")
     print("-" * 72)
@@ -120,7 +121,7 @@ def main() -> int:
                   f"{' / Job#' + str(payload.job_id) if payload.job_id else ''}")
 
     audit = AuditStore(temp_dir / "smoke-audit.sqlite3")
-    runner = PrintRunner(spooler, audit, queue_timeout=30, mode=args.mode)
+    runner = PrintRunner(spooler, audit, queue_timeout=30)
     started = time.monotonic()
     results = runner.run_cases([case], printer, f"SMOKE-{int(time.time())}", on_event)
     elapsed = time.monotonic() - started

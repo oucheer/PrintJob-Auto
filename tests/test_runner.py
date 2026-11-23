@@ -20,13 +20,13 @@ class FakeSpooler:
         return list(self.jobs)
 
 
-def fake_driver_writer(written=None):
-    """替身：跳过真实 DEVMODE 写入，记录调用；返回空恢复函数。"""
-    def write(printer, case, log=None, win32module=None, caps=None):
+def fake_driver_applier(written=None):
+    """替身：跳过真实驱动属性页操作，记录调用；返回空恢复函数。"""
+    def apply(printer, case, log=None, caps=None):
         if written is not None:
             written.append((printer, case))
         return lambda: None
-    return write
+    return apply
 
 
 def fake_submitter(spooler=None, record=None, backend="gdi-pdf"):
@@ -44,7 +44,7 @@ def make_runner(spooler, tmp_path, submitter, **kwargs):
     return PrintRunner(
         spooler, AuditStore(tmp_path / "history.sqlite3"),
         queue_timeout=1, submitter=submitter,
-        driver_writer=fake_driver_writer(), **kwargs,
+        driver_applier=fake_driver_applier(), **kwargs,
     )
 
 
@@ -105,19 +105,19 @@ def test_runner_routes_pdf_to_gdi_and_logs_steps(tmp_path):
     assert record[0][2].suffix == ".pdf"
     assert result.settings["backend"] == "gdi-pdf"
     joined = "\n".join(text for kind, text in events if kind == "log")
-    assert "步骤 1/4" in joined and "写入驱动打印属性" in joined
+    assert "步骤 1/4" in joined and "打印首选项" in joined
     assert "步骤 2/4" in joined and "打开打印文档 sample.pdf" in joined
     assert "步骤 3/4" in joined and "选择打印机 Test Printer" in joined
 
 
-def test_runner_writes_devmode_before_submit_and_restores_after(tmp_path):
-    """属性写入（步骤1）必须先于下发，且结束后调用恢复。"""
+def test_runner_sets_driver_ui_before_submit_and_restores_after(tmp_path):
+    """驱动属性页设置（步骤1）必须先于下发，且结束后调用还原。"""
     spooler = FakeSpooler()
     order = []
     written = []
 
-    def driver_writer(printer, case, log=None, win32module=None, caps=None):
-        order.append("write")
+    def driver_applier(printer, case, log=None, caps=None):
+        order.append("apply")
         written.append((printer, case.paper))
         return lambda: order.append("restore")
 
@@ -131,9 +131,9 @@ def test_runner_writes_devmode_before_submit_and_restores_after(tmp_path):
     case = PrintCase(case_id="TC-ORDER", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer", paper="A4")
     runner = PrintRunner(
         spooler, AuditStore(tmp_path / "audit.sqlite3"),
-        queue_timeout=1, submitter=submit, driver_writer=driver_writer,
+        queue_timeout=1, submitter=submit, driver_applier=driver_applier,
     )
     result = runner.run_cases([case], "Test Printer", "RUN004", lambda *_: None)[0]
     assert result.status == CaseStatus.DRIVER_PRINTED
-    assert order == ["write", "submit", "restore"]
+    assert order == ["apply", "submit", "restore"]
     assert written == [("Test Printer", "A4")]

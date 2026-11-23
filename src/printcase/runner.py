@@ -11,7 +11,7 @@ from typing import Callable
 
 from .audit import AuditStore
 from .direct_print import DirectPrintError, print_with_driver
-from .driver_settings import DriverSettingsError, apply_case_to_driver
+from .driver_ui import DriverUiError, apply_case
 from .models import CaseResult, CaseStatus, PrintCase
 from .office import DocumentConversionError
 from .ui_print import UI_PRINTABLE_EXTENSIONS, UiPrintError, print_with_ui
@@ -19,22 +19,20 @@ from .separator import create_case_separator_pdf
 from .validator import normalize_paper, validate_case
 
 
-def _is_access_denied(error: BaseException) -> bool:
-    """识别打印机权限不足（虚拟打印机常不允许修改默认 DEVMODE）。"""
-    text = f"{type(error).__name__}: {error}"
-    return "拒绝访问" in text or "Access is denied" in text or "error: (5" in text
-
-
 ERROR_JOB_MASKS = ("打印错误", "打印机离线", "缺纸", "作业已暂停", "驱动阻止作业", "需要人工干预")
 
 
 class PrintRunner:
-    """按“写驱动属性 → 打开文档 → 选择驱动 → 下发打印 → 恢复默认”的流程执行用例。
+    """按“驱动界面设属性 → 打开文档 → 下发打印 → 还原驱动默认”的流程执行用例。
 
-    打印不依赖外部组件：文字文档走 Word/WPS COM 直打，
-    PDF/图片经内置 GDI 引擎直打，其余格式先转 PDF 再 GDI。
-    每个步骤都通过 on_event("log", ...) 推送到前端日志页，用户可以完整看到
-    打开文档、选择驱动、下发作业的操作过程。
+    只有一条通道：属性一律在驱动自己的“打印首选项”里设置并回读确认
+    （见 driver_ui），不再直接改写驱动 DEVMODE；文档提交时：
+
+    - Word/WPS 能打开的文档走 UI 自动化（Ctrl+P → 选驱动 → 打印）；
+    - PDF/图片等没有文档界面的格式由内置渲染器送入打印队列。
+
+    两种提交方式都继承刚刚设置并校验过的驱动默认设置。每个步骤都通过
+    on_event("log", ...) 推送到前端日志页，用户可以完整看到操作过程。
     """
 
     def __init__(
@@ -44,8 +42,7 @@ class PrintRunner:
         queue_timeout: int = 90,
         submitter: Callable[..., tuple[str, str]] | None = None,
         document_converter: Callable[..., Path] | None = None,
-        driver_writer: Callable[..., Callable[[], None]] | None = None,
-        mode: str = "direct",
+        driver_applier: Callable[..., Callable[[], None]] | None = None,
         ui_submitter: Callable[..., tuple[str, str]] | None = None,
     ) -> None:
         self.spooler = spooler
@@ -53,8 +50,7 @@ class PrintRunner:
         self.queue_timeout = queue_timeout
         self.document_converter = document_converter or None
         self.submit = submitter or self._default_submit
-        self.driver_writer = driver_writer or apply_case_to_driver
-        self.mode = mode or "direct"  # direct=内置直打；ui=pywinauto UI 自动化
+        self.driver_applier = driver_applier or apply_case
         self.ui_submitter = ui_submitter or self._default_ui_submit
         self.stop_event = threading.Event()
 
@@ -67,14 +63,19 @@ class PrintRunner:
         )
 
     def _default_ui_submit(self, printer: str, job_case: PrintCase, source_path: Path, log: Callable[[str], None], temp_dir: Path) -> tuple[str, str]:
-        """UI 自动化下发：文字文档走 pywinauto；其它格式回落内置 GDI 直打。"""
+        """文档界面自动化下发；PDF/图片等没有文档界面的格式交由内置渲染器送入队列。"""
         if Path(source_path).suffix.lower() in UI_PRINTABLE_EXTENSIONS:
-            return print_with_ui(printer, job_case, source_path, log, timeout=job_case.timeout_seconds)
-        log(f"{Path(source_path).suffix} 没有可自动化的文档界面，本次使用内置 GDI 直打通道")
-        return self._default_submit(printer, job_case, source_path, log, temp_dir)
+            # 属性已由驱动属性页设置并回读确认，这里只做“打开文档→选驱动→打印”
+            return print_with_ui(
+                printer, job_case, source_path, log,
+                timeout=job_case.timeout_seconds,
+                set_driver_attributes=False,
+            )
+        log(f"{Path(source_path).suffix} 没有可自动化的文档界面，本次由内置渲染器送入打印队列")
+        return self.submit(printer, job_case, source_path, log, temp_dir)
 
-    def _active_submit(self) -> Callable[..., tuple[str, str]]:
-        return self.ui_submitter if self.mode == "ui" else self.submit
+    def _submit_case(self, printer: str, job_case: PrintCase, source_path: Path, log: Callable[[str], None], temp_dir: Path):
+        return self.ui_submitter(printer, job_case, source_path, log, temp_dir)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -149,18 +150,7 @@ class PrintRunner:
         )
         emit(f"用例开始，目标打印机：{printer}")
         if case.borderless == "yes":
-            emit("无边距打印将按打印机驱动当前默认设置执行；命令行无法强制开启，请先在驱动首选项中配置无边距/满版打印。")
-        devmode_attrs = []
-        if case.collate:
-            devmode_attrs.append("逐份/非逐份")
-        if case.print_quality.lower() != "auto":
-            devmode_attrs.append(f"打印质量 {case.print_quality}")
-        if case.media_type:
-            devmode_attrs.append(f"纸张类型 {case.media_type}")
-        if case.paper and normalize_paper(case.paper) not in {"", "auto", "mixed"}:
-            devmode_attrs.append(f"纸张尺寸 {case.paper}")
-        if case.bin and not str(case.bin).isdigit():
-            devmode_attrs.append(f"纸盒 {case.bin}")
+            emit("无边距将在驱动属性页里勾选；驱动界面没有该选项时用例判定失败且不下发。")
         on_event("result", result)
 
         temp_dir: Path | None = None
@@ -172,36 +162,25 @@ class PrintRunner:
             except Exception as status_error:
                 emit(f"无法读取打印机状态：{status_error}")
 
-            # 步骤 1/4：把用例属性写入驱动默认 DEVMODE（写入后回读确认）
-            emit("步骤 1/4：写入驱动打印属性（纸张类型/尺寸/纸盒/质量/逐份）")
+            # 步骤 1/4：在驱动属性页里设置用例属性（设置后只读回读默认 DEVMODE 校验）
+            emit("步骤 1/4：打开驱动“打印首选项”，按用例设置纸张尺寸/纸张类型/来源/双面/颜色/份数")
             caps = None
             try:
                 caps = self.spooler.get_capabilities(printer)
             except Exception as caps_error:
-                emit(f"无法读取驱动能力，DEVMODE 取值将用内置代号表：{caps_error}")
+                emit(f"无法读取驱动能力，属性将按名称在驱动界面里匹配：{caps_error}")
             try:
-                restore_driver = self.driver_writer(
-                    printer, case, caps=caps,
-                    log=emit,
-                )
-            except (DriverSettingsError, Exception) as ds_error:  # noqa: WPS440
-                if _is_access_denied(ds_error):
-                    # 虚拟打印机/受限账户不允许改默认参数：明确告警后仍按驱动默认下发
-                    restore_driver = None
-                    result.settings["devmode_skipped"] = True
-                    emit("该打印机不允许修改默认参数（权限不足，常见于虚拟打印机），"
-                         "本次跳过驱动属性写入，按驱动当前默认设置下发；请在驱动首选项中确认属性。")
-                elif isinstance(ds_error, DriverSettingsError):
-                    # 严格模式：属性无法保证生效时不下发，避免“属性静默失效但作业照常打印”
-                    result.status = CaseStatus.FAILED
-                    result.message = f"为保证属性准确，本次不下发：{ds_error}"
-                    emit(result.message)
-                    return result
-                else:
-                    result.status = CaseStatus.FAILED
-                    result.message = f"驱动 DEVMODE 写入异常，为保证属性准确本次不下发：{type(ds_error).__name__}: {ds_error}"
-                    emit(result.message)
-                    return result
+                restore_driver = self.driver_applier(printer, case, caps=caps, log=emit)
+            except DriverUiError as du_error:
+                result.status = CaseStatus.FAILED
+                result.message = f"为保证属性准确，本次不下发：{du_error}"
+                emit(result.message)
+                return result
+            except Exception as du_error:  # noqa: WPS440
+                result.status = CaseStatus.FAILED
+                result.message = f"驱动属性页操作异常，为保证属性准确本次不下发：{type(du_error).__name__}: {du_error}"
+                emit(result.message)
+                return result
 
             source_path = Path(case.resolved_path or case.file_path)
             temp_dir = Path(tempfile.mkdtemp(prefix="printcase_job_"))
@@ -217,15 +196,8 @@ class PrintRunner:
             emit(f"步骤 2/4：打开打印文档 {source_path.name}")
             emit(f"步骤 3/4：选择打印机 {printer} 并按用例属性下发")
             baseline = {job.job_id for job in self.spooler.get_jobs(printer)}
-            if case.extended_attrs and self.mode != "ui":
-                emit(f"注意：本用例含 {len(case.extended_attrs)} 项驱动扩展属性（水印/装订/作业类型等），"
-                     "这些属性只在“UI 自动化（pywinauto）”下发方式下生效；当前为直接驱动模式，已跳过。")
-                result.settings["extended_skipped"] = [attr.describe() for attr in case.extended_attrs]
-            submit = self._active_submit()
-            if self.mode == "ui":
-                emit("下发方式：UI 自动化（打开文档 → Ctrl+P → 选择驱动 → 设置属性 → 打印）")
             try:
-                submit_result = submit(printer, job_case, source_path, emit, temp_dir)
+                submit_result = self._submit_case(printer, job_case, source_path, emit, temp_dir)
                 backend, doc_stem = submit_result[0], submit_result[1]
                 job_hint = submit_result[2] if len(submit_result) > 2 else None
                 if job_hint:
@@ -237,7 +209,7 @@ class PrintRunner:
                 return result
             except DirectPrintError as submit_error:
                 result.status = CaseStatus.FAILED
-                result.message = f"直接打印链路失败：{submit_error}"
+                result.message = f"打印下发失败：{submit_error}"
                 emit(result.message)
                 return result
             except FileNotFoundError as submit_error:
@@ -261,7 +233,7 @@ class PrintRunner:
             if case.separator_page in {"after", "both"} and result.status != CaseStatus.STOPPED:
                 self._print_separator_page(case, printer, on_event, position="after", temp_dir=temp_dir, caps=caps, emit=emit)
 
-            emit("步骤 4/4：恢复驱动默认设置（在 finally 中执行）")
+            emit("步骤 4/4：还原驱动默认设置（在 finally 中执行）")
 
         except Exception as exc:
             result.status = CaseStatus.FAILED
@@ -271,7 +243,7 @@ class PrintRunner:
                 try:
                     restore_driver()
                 except Exception as restore_error:
-                    emit(f"驱动默认设置恢复失败，请在驱动首选项中手工核对：{restore_error}")
+                    emit(f"驱动默认设置还原失败，请在驱动首选项中手工核对：{restore_error}")
             if temp_dir is not None:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             result.ended_at = datetime.now()
@@ -397,14 +369,14 @@ class PrintRunner:
             sep_case.resolved_path = sep_pdf
             label = {"before": "前置", "after": "后置"}.get(position, position)
             emit(f"正在打印{label}分隔页：{sep_pdf.name}")
-            # 分隔页要求单面黑白：为分隔页单独写入 DEVMODE（结束后恢复到主用例属性）
+            # 分隔页要求单面黑白：为分隔页单独设置驱动属性（结束后恢复到主用例属性）
             sep_restore = None
             try:
-                sep_restore = self.driver_writer(printer, sep_case, caps=caps, log=emit)
-            except DriverSettingsError as sep_ds_error:
-                emit(f"分隔页驱动属性写入失败，按当前驱动默认设置打印分隔页：{sep_ds_error}")
+                sep_restore = self.driver_applier(printer, sep_case, caps=caps, log=emit)
+            except DriverUiError as sep_ds_error:
+                emit(f"分隔页驱动属性设置失败，按当前驱动默认设置打印分隔页：{sep_ds_error}")
             try:
-                self._active_submit()(printer, sep_case, sep_pdf, emit, temp_dir)
+                self._submit_case(printer, sep_case, sep_pdf, emit, temp_dir)
                 emit(f"{label}分隔页已提交打印。")
             finally:
                 if sep_restore is not None:
@@ -425,7 +397,7 @@ class PrintRunner:
                 self._print_separator_page(case, printer, on_event, position=f"第{index}份前", temp_dir=temp_dir, caps=caps, emit=emit)
                 one = replace(case, copies=1)
                 emit(f"正在下发第 {index}/{case.copies} 份")
-                self._active_submit()(printer, one, source_path, emit, temp_dir)
+                self._submit_case(printer, one, source_path, emit, temp_dir)
                 emit(f"第 {index}/{case.copies} 份已提交打印。")
             except Exception as copy_error:
                 emit(f"第 {index} 份下发失败（不影响已完成部分）：{copy_error}")

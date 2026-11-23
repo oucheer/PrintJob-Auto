@@ -1,4 +1,4 @@
-"""无头验证：切到 UI 自动化模式时自检是否通过（不弹错误框）。"""
+"""无头验证：驱动属性页自检是否通过（不弹错误框）。"""
 from __future__ import annotations
 
 import sys
@@ -18,19 +18,17 @@ root.withdraw()
 application = app_module.PrintCaseApp(root)
 root.update()
 
-ui_label = next(label for label, mode in application.MODE_BY_LABELS.items() if mode == "ui")
-application.mode_var.set(ui_label)
-application._on_mode_changed()
+application._check_driver_ui()
 
-deadline = time.time() + 20
+deadline = time.time() + 40
 while time.time() < deadline:
     root.update()
     time.sleep(0.1)
-    if "自检" not in application.status_var.get() and "正在自检" not in application.status_var.get():
+    if "自检中" not in application.driver_label.cget("text"):
         break
 
 print("状态栏：", application.status_var.get())
-print("当前下发方式变量：", application.mode_var.get())
+print("驱动属性页：", application.driver_label.cget("text"))
 print("警告框数量：", len(warnings_seen))
 for item in warnings_seen:
     print("  警告：", item)

@@ -287,11 +287,12 @@ def _select_printer_in_backstage(window, printer: str, log: Callable[[str], None
     time.sleep(0.6)
     for container in (window,):
         for item in _descendants(container, control_type="ListItem"):
-            if _norm(printer) and _norm(printer) in _norm(_text_of(item)):
+            text = _text_of(item)
+            if _norm(printer) and _norm(printer) in _norm(text):
                 item.click_input()
-                log(f"后台打印视图：已选择打印机驱动 {_text_of(item)}")
+                log(f"后台打印视图：已选择打印机驱动 {text.strip() or printer}")
                 return True
-    log(f"后台打印视图：下拉中未找到 {printer}，沿用当前打印机")
+    log(f"后台打印视图：下拉中未找到 {printer}，无法保证作业发往目标打印机")
     return False
 
 
@@ -657,8 +658,13 @@ def print_with_ui(
     timeout: float = 90,
     desktop=None,
     opener: Callable[..., tuple[Callable[[], None], str]] | None = None,
+    set_driver_attributes: bool = True,
 ) -> tuple[str, str]:
-    """通过 UI 自动化（pywinauto）下发打印。返回 (通道标识, 作业名主干)。"""
+    """通过 UI 自动化（pywinauto）下发打印。返回 (通道标识, 作业名主干)。
+
+    ``set_driver_attributes=False`` 表示属性已由 driver_ui 在驱动“打印首选项”
+    里设置并回读确认，这里只负责打开文档、选择驱动、填份数/页码、点“打印”。
+    """
     source_path = Path(source_path)
     if source_path.suffix.lower() not in UI_PRINTABLE_EXTENSIONS:
         raise UiPrintError(
@@ -706,19 +712,20 @@ def print_with_ui(
 
         unresolved = apply_print_dialog_attrs(container, case.extended_attrs or [], log)
 
-        try:
-            driver_window = _open_preferences(container, desktop, log, timeout)
-        except UiPrintError as pref_error:
-            if case.extended_attrs or case.borderless == "yes":
-                raise
-            log(f"未找到驱动“首选项/属性”入口（{pref_error}）；"
-                "标准属性已由 DEVMODE 写入并回读确认，继续执行打印。")
-            driver_window = None
-        if driver_window is not None:
-            unresolved += _apply_case_attributes(driver_window, case, log)
-            unresolved += apply_driver_attrs(driver_window, case.extended_attrs or [], log)
-            _confirm(driver_window, log)
-            log("驱动属性已确认，返回打印对话框")
+        if set_driver_attributes:
+            try:
+                driver_window = _open_preferences(container, desktop, log, timeout)
+            except UiPrintError as pref_error:
+                if case.extended_attrs or case.borderless == "yes":
+                    raise
+                log(f"未找到驱动“首选项/属性”入口（{pref_error}）；"
+                    "标准属性已由驱动属性页设置并回读确认，继续执行打印。")
+                driver_window = None
+            if driver_window is not None:
+                unresolved += _apply_case_attributes(driver_window, case, log)
+                unresolved += apply_driver_attrs(driver_window, case.extended_attrs or [], log)
+                _confirm(driver_window, log)
+                log("驱动属性已确认，返回打印对话框")
 
         if unresolved:
             raise UiPrintError(
