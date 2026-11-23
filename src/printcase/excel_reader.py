@@ -282,10 +282,12 @@ def read_cases(file_path: str | Path, sheet_name: str | None = None) -> tuple[li
             if not case_id:
                 case_id = f"ROW-{excel_row}"
                 warnings.append(f"第 {excel_row} 行没有用例 ID，已临时使用 {case_id}。")
-            if not file_ref:
-                warnings.append(f"{case_id}：文件路径为空。")
 
             enabled, enabled_error = _parse_bool(get("enabled", True), True)
+            # 禁用的用例不会下发（如打印机面板生成的内部页，本就没有文件），
+            # 对其报告“文件路径为空”是误导性警告；只对启用且缺文件的用例告警。
+            if not file_ref and enabled:
+                warnings.append(f"{case_id}：文件路径为空。")
             copies, copies_error = _parse_int(get("copies", 1), 1, "份数")
             timeout_seconds, timeout_error = _parse_int(get("timeout_seconds", 90), 90, "超时秒数")
             input_errors = [e for e in (enabled_error, copies_error, timeout_error) if e]

@@ -132,7 +132,11 @@ def plan_actions(case: PrintCase, caps: dict | None = None) -> list[Action]:
     elif case.duplex == "simplex":
         actions.append(Action(TAB_BASIC, "双面", "radio", DUPLEX_LABELS["simplex"], "Duplex", 1))
 
-    if case.color:
+    # 黑白设备本身只有一种颜色，驱动属性页通常没有“颜色”选项；此时不下发颜色动作，
+    # 否则严格模式会因“找不到颜色选项”拒绝下发，且回读 COLOR 也永远匹配不上彩色。
+    # 驱动未提供能力（caps 为 None / color=None）时保持原行为，按名称到界面里匹配。
+    device_is_monochrome = caps.get("color") is False
+    if case.color and not device_is_monochrome:
         actions.append(Action(TAB_BASIC, "颜色", "radio", COLOR_LABELS.get(case.color, (case.color,)), "Color", COLOR_CODES.get(case.color)))
 
     quality = str(case.print_quality or "").lower()
@@ -365,9 +369,14 @@ def _win32print():
 
 
 def snapshot(printer: str, w=None) -> dict:
-    """只读读取驱动当前默认 DEVMODE（用于校验与还原）。"""
+    """只读读取驱动当前默认 DEVMODE（用于校验与还原）。
+
+    只需要 PRINTER_ACCESS_USE：普通用户会话下请求 PRINTER_ALL_ACCESS /
+    PRINTER_ACCESS_ADMINISTER 会被拒绝（Win32 错误 5），导致整个下发链路
+    在“设置属性”之前就中断。只读快照与回读校验都属于只读操作。
+    """
     w = w or _win32print()
-    handle = w.OpenPrinter(printer, {"DesiredAccess": w.PRINTER_ALL_ACCESS})
+    handle = w.OpenPrinter(printer, {"DesiredAccess": w.PRINTER_ACCESS_USE})
     try:
         info = w.GetPrinter(handle, 2)
         devmode = info.get("pDevMode")
@@ -390,17 +399,43 @@ def snapshot(printer: str, w=None) -> dict:
 
 
 def restore(before: dict, printer: str, w=None, log=None) -> None:
-    """把驱动默认 DEVMODE 还原成执行前快照（只写回原值，不参与属性设置）。"""
+    """把驱动默认 DEVMODE 还原成执行前快照（只写回原值，不参与属性设置）。
+
+    写回打印机全局默认设置需要管理权限，普通用户会话下会被拒绝（错误 5）。
+    此时降级为明确警告，绝不能把已经成功下发的作业改判为失败；调用方通过
+    返回值/日志即可知道需要人工核对。
+    """
     w = w or _win32print()
-    handle = w.OpenPrinter(printer, {"DesiredAccess": w.PRINTER_ALL_ACCESS})
-    try:
-        info = w.GetPrinter(handle, 2)
-        info["pDevMode"] = before["devmode"]
-        w.SetPrinter(handle, 2, info, 0)
-    finally:
-        w.ClosePrinter(handle)
+    failures: list[str] = []
+    # 部分系统/驱动上 OpenPrinter(ADMINISTER) 会“假成功”返回句柄，但紧接着的
+    # GetPrinter 被拒绝；因此必须把 打开→读取→写回 当作一个完整探测，逐档尝试。
+    for access_name in ("PRINTER_ACCESS_ADMINISTER", "PRINTER_ACCESS_USE"):
+        access = getattr(w, access_name, None)
+        if access is None:
+            continue
+        handle = None
+        try:
+            try:
+                handle = w.OpenPrinter(printer, {"DesiredAccess": access})
+            except Exception as open_error:  # noqa: WPS420
+                failures.append(f"{access_name} 打开失败：{open_error}")
+                continue
+            info = w.GetPrinter(handle, 2)
+            info["pDevMode"] = before["devmode"]
+            w.SetPrinter(handle, 2, info, 0)
+        except Exception as step_error:  # noqa: WPS420
+            failures.append(f"{access_name} 读写失败：{step_error}")
+            continue
+        finally:
+            if handle is not None:
+                w.ClosePrinter(handle)
+        if log:
+            log("驱动默认设置已还原为用例执行前的快照。")
+        return True
     if log:
-        log("驱动默认设置已还原为用例执行前的快照。")
+        log("当前账户无写回打印机默认设置的权限，未能自动还原驱动默认值（"
+            + "；".join(failures) + "）；请在打印首选项中手工核对，本次打印结果不受影响。")
+    return False
 
 
 def verify(printer: str, actions: list[Action], before: dict, w=None) -> list[str]:
