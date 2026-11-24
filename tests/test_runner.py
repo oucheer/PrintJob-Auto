@@ -137,3 +137,90 @@ def test_runner_sets_driver_ui_before_submit_and_restores_after(tmp_path):
     assert result.status == CaseStatus.DRIVER_PRINTED
     assert order == ["apply", "submit", "restore"]
     assert written == [("Test Printer", "A4")]
+
+
+def test_runner_cleans_stale_driver_ui_after_stop(tmp_path, monkeypatch):
+    """停止后必须清理驱动属性页残留，否则下一次下发会“属性页窗口未出现”。"""
+    import printcase.runner as runner_module
+
+    spooler = FakeSpooler()
+    cleaned: list[str] = []
+
+    def fake_apply(printer, case, caps=None, log=None):
+        return lambda: None
+
+    monkeypatch.setattr(runner_module, "apply_case", fake_apply)
+    monkeypatch.setattr(
+        runner_module, "close_stale_preferences",
+        lambda printer, log=None: cleaned.append(printer) or 0,
+    )
+
+    holder = {}
+
+    def submit(printer, case, source_path, log, temp_dir):
+        holder["runner"].stop()          # 用户在下发过程中点了“停止”
+        return "gdi-pdf", Path(source_path).stem
+
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"pdf")
+    case = PrintCase(case_id="TC-STOP", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
+    runner = PrintRunner(
+        spooler, AuditStore(tmp_path / "audit.sqlite3"),
+        queue_timeout=1, submitter=submit, driver_applier=fake_apply,
+    )
+    holder["runner"] = runner
+    results = runner.run_cases([case], "Test Printer", "RUN005", lambda *_: None)
+
+    assert results[0].status == CaseStatus.STOPPED
+    # 本轮第一次设置属性前会清一次残留，停止后再清一次
+    assert cleaned and set(cleaned) == {"Test Printer"}
+
+
+class BusySpooler(FakeSpooler):
+    """支持高频监视的替身：上一件作业一直留在队列里。"""
+
+    supports_queue_watch = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.busy = False
+
+    def get_jobs(self, name):
+        if self.busy:
+            return [QueueJob(900, "previous.pdf", 0, "正在打印", 0, 2)]
+        return []
+
+
+def test_runner_waits_for_previous_job_before_opening_driver_page(tmp_path, monkeypatch):
+    """上一件作业还在队列里时，先等它离开队列再打开驱动属性页。"""
+    import printcase.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "QUEUE_SETTLE_TIMEOUT", 1.0)
+    spooler = BusySpooler()
+    order: list[str] = []
+
+    def driver_applier(printer, case, log=None, caps=None):
+        order.append("apply")
+        return lambda: None
+
+    def submit(printer, case, source_path, log, temp_dir):
+        order.append("submit")
+        spooler.busy = True          # 作业进了队列且迟迟不离开
+        return "gdi-pdf", Path(source_path).stem
+
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"pdf")
+    cases = [
+        PrintCase(case_id=f"TC-SETTLE-{i}", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
+        for i in range(2)
+    ]
+    logs: list[str] = []
+    runner = PrintRunner(
+        spooler, AuditStore(tmp_path / "audit.sqlite3"),
+        queue_timeout=1, submitter=submit, driver_applier=driver_applier,
+    )
+    runner.run_cases(cases, "Test Printer", "RUN006", lambda kind, value: logs.append(str(value)))
+
+    # 第二件作业开始前出现“队列仍有作业”的等待，之后才继续设置属性
+    assert any("队列仍有" in line for line in logs)
+    assert order == ["apply", "submit", "apply", "submit"]

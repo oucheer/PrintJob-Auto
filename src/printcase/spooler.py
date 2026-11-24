@@ -18,6 +18,9 @@ class QueueJob:
 class WindowsSpooler:
     """Thin adapter over Win32 print spooler APIs. Only enabled on Windows."""
 
+    # 支持后台高频监视队列（见 queue_watch.QueueWatcher）
+    supports_queue_watch = True
+
     def __init__(self) -> None:
         if platform.system() != "Windows":
             raise RuntimeError("打印队列监控仅支持 Windows 10/11。")

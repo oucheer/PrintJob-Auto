@@ -181,8 +181,12 @@ def make_case(**kwargs) -> PrintCase:
     return PrintCase(**base)
 
 
-def build_ui(*, paper_options=None, print_clicked=None, driver_pref_button=True, confirm_close=True):
-    """构造文档窗口 + 打印对话框 + 驱动属性窗口的替身。"""
+def build_ui(*, paper_options=None, print_clicked=None, driver_pref_button=True, confirm_close=True,
+             swallow_keys: int = 0):
+    """构造文档窗口 + 打印对话框 + 驱动属性窗口的替身。
+
+    swallow_keys：前 N 次 Ctrl+P 被吞掉（模拟 Word 冷启动时焦点不在正文）。
+    """
     paper_options = paper_options or ["A4 (210 x 297mm)", "A3 (297 x 420mm)"]
     doc_window = FakeWindow("报告.docx - Word", class_name="OpusApp")
     dialog = FakeWindow("打印", class_name="#32770")
@@ -248,7 +252,12 @@ def build_ui(*, paper_options=None, print_clicked=None, driver_pref_button=True,
     FakeCheck("无边距", checked=0, parent=driver)
     FakeButton("确定", on_click=lambda: setattr(driver, "visible", False), parent=driver)
 
+    key_state = {"count": 0}
+
     def on_keys(_keys):
+        key_state["count"] += 1
+        if key_state["count"] <= swallow_keys:
+            return  # 模拟按键被吞：打印界面不出现
         if not state["dialog_open"]:
             state["dialog_open"] = True
 
@@ -301,6 +310,45 @@ def test_ui_print_full_flow_sets_driver_attributes(tmp_path):
     assert "已选择打印机驱动 Pantum CM806ADN" in joined
     assert "纸张尺寸 设置为 A4 (210 x 297mm)" in joined
     assert "打印作业已提交" in joined
+
+
+def test_ui_print_retries_ctrl_p_when_first_press_is_lost(tmp_path, monkeypatch):
+    """Word 冷启动时首次 Ctrl+P 可能被吞掉：必须重试而不是干等到超时判失败。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_VIEW_WAIT_PER_TRY", 0.6)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    desktop, opener, dialog, driver, rows, state, opened = build_ui(swallow_keys=2)
+
+    logs = []
+    backend, stem = print_with_ui(
+        "Pantum CM806ADN", make_case(), docx, logs.append,
+        timeout=15, desktop=desktop, opener=opener,
+    )
+
+    assert backend == "ui-automation" and stem == "报告"
+    assert state["print_clicked"] is True
+    joined = "\n".join(logs)
+    assert "第 3 次" in joined, joined       # 第 3 次才调出打印界面
+    assert "重试" in joined
+
+
+def test_ui_print_reports_attempt_count_when_print_view_never_appears(tmp_path, monkeypatch):
+    """始终调不出打印界面时，报错要说明尝试次数，便于排查。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_VIEW_WAIT_PER_TRY", 0.4)
+    monkeypatch.setattr(ui_print, "PRINT_VIEW_MAX_ATTEMPTS", 3)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    desktop, opener, dialog, driver, rows, state, opened = build_ui(swallow_keys=99)
+
+    with pytest.raises(UiPrintError) as excinfo:
+        print_with_ui("Pantum CM806ADN", make_case(), docx, lambda _t: None,
+                      timeout=10, desktop=desktop, opener=opener)
+    assert "已尝试 3 次" in str(excinfo.value)
+    assert state["print_clicked"] is False
 
 
 def test_ui_print_fails_when_driver_option_missing(tmp_path):
@@ -361,3 +409,216 @@ def test_default_channel_routes_documents_to_ui_and_other_formats_to_renderer(tm
     runner._default_ui_submit("Test Printer", pdf_case, pdf, lambda _t: None, tmp_path)
 
     assert calls == [("ui", ".docx"), ("renderer", ".pdf")]
+
+
+class FakeListItem(FakeContainer):
+    def __init__(self, label: str, parent=None):
+        super().__init__(text=label, control_type="ListItem")
+        if parent is not None:
+            parent.children.append(self)
+            self._parent = parent
+
+    def click_input(self) -> None:
+        pass
+
+    def window_text(self) -> str:
+        return self.text
+
+
+class FakeWordApp:
+    """Word COM 替身：只提供 BackgroundPrintingStatus。"""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.reads = 0
+
+    @property
+    def BackgroundPrintingStatus(self):
+        self.reads += 1
+        if not self.values:
+            return 0
+        return self.values.pop(0)
+
+
+def build_backstage(*, accept_click: bool = True, app=None):
+    """构造 Word 后台打印视图：主窗口内带打印机下拉 + “打印”按钮。"""
+    window = FakeWindow("报告.docx - Word", class_name="OpusApp")
+    # 真实 Word 的下拉项文本里带“打印机”字样（UIA 用它识别后台打印视图）
+    combo = FakeCombo("打印机", ["打印机", "Pantum CM806ADN"])
+    combo.click_input = lambda: None
+    FakeListItem("Pantum CM806ADN", parent=window)
+    window.children.append(combo)
+
+    state = {"clicked": 0}
+
+    def on_click():
+        state["clicked"] += 1
+        if accept_click and combo in window.children:
+            window.children.remove(combo)   # 视图关闭 = 回到文档
+
+    FakeButton("打印", on_click=on_click, parent=window)
+
+    def opener(_path, _log):
+        return (lambda: None), "报告", None, app
+
+    return FakeDesktop([window]), opener, state, window
+
+
+def test_backstage_print_confirms_view_closed_then_waits_handoff(tmp_path, monkeypatch):
+    """点击“打印”后必须确认视图关闭 + Word 后台任务交接，才允许关闭文档。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_START_TIMEOUT", 0.6)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    app = FakeWordApp([1, 1, 0])          # 先有 1 个后台任务，随后交接完成
+    desktop, opener, state, window = build_backstage(app=app)
+
+    logs = []
+    backend, stem = print_with_ui(
+        "Pantum CM806ADN", make_case(copies=1), docx, logs.append,
+        timeout=5, desktop=desktop, opener=opener, set_driver_attributes=False,
+    )
+
+    assert backend == "ui-automation" and stem == "报告"
+    assert state["clicked"] == 1
+    joined = "\n".join(logs)
+    assert "打印视图已关闭，Word 已接受打印指令" in joined
+    assert "Word 已接收打印指令" in joined
+    assert "已完成交接" in joined
+    assert app.reads >= 2
+    # 视图已关闭（打印机下拉被移除）
+    assert all(child.control_type != "ComboBox" for child in window.children)
+
+
+def test_backstage_print_retries_when_click_not_accepted(tmp_path, monkeypatch):
+    """点击后打印视图不关闭 = 指令没被接受：必须重试，仍失败则判失败而不是记成已提交。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_START_TIMEOUT", 0.3)
+    monkeypatch.setattr(ui_print, "PRINT_CLICK_ATTEMPTS", 2)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    desktop, opener, state, _window = build_backstage(accept_click=False, app=None)
+
+    logs = []
+    with pytest.raises(UiPrintError) as excinfo:
+        print_with_ui("Pantum CM806ADN", make_case(copies=1, ), docx, logs.append,
+                      timeout=5, desktop=desktop, opener=opener, set_driver_attributes=False)
+
+    assert state["clicked"] == 2                     # 重试了一次
+    assert "重新点击“打印”" in "\n".join(logs)
+    assert "没有接受打印指令" in str(excinfo.value)
+
+
+def test_backstage_print_handoff_timeout_still_counts_as_submitted(tmp_path, monkeypatch):
+    """Word 不报告后台任务时不能误判失败，但日志要说明只确认了视图关闭。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_START_TIMEOUT", 0.6)
+    monkeypatch.setattr(ui_print, "PRINT_CONFIRM_WAIT", 0.4)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    desktop, opener, state, _window = build_backstage(app=FakeWordApp([]))
+
+    logs = []
+    print_with_ui("Pantum CM806ADN", make_case(copies=1, ), docx, logs.append,
+                  timeout=5, desktop=desktop, opener=opener, set_driver_attributes=False)
+
+    joined = "\n".join(logs)
+    assert "未报告后台打印任务" in joined
+    assert "未读到 Word 后台任务" in joined
+
+
+class FlakyWindow(FakeWindow):
+    """前 N 次读 UIA 抛 COMError（Word 忙着渲染打印预览时的真实行为）。"""
+
+    def __init__(self, title: str, class_name: str = "OpusApp", failures: int = 3):
+        super().__init__(title, class_name=class_name)
+        self.remaining_failures = failures
+
+    def descendants(self, control_type=None, **kwargs):
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise RuntimeError("(-2147417846, '消息筛选器显示应用程序正在使用中。')")
+        return super().descendants(control_type=control_type, **kwargs)
+
+
+def test_backstage_tolerates_com_error_while_polling_print_view(tmp_path, monkeypatch):
+    """Word 忙时 UIA 会抛 COMError：不能因此把用例判失败。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_START_TIMEOUT", 1.5)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+
+    window = FlakyWindow("报告.docx - Word", failures=4)
+    combo = FakeCombo("打印机", ["打印机", "Pantum CM806ADN"])
+    combo.click_input = lambda: None
+    window.children.append(combo)
+    FakeListItem("Pantum CM806ADN", parent=window)
+
+    def on_click():
+        if combo in window.children:
+            window.children.remove(combo)
+
+    FakeButton("打印", on_click=on_click, parent=window)
+
+    def opener(_path, _log):
+        return (lambda: None), "报告", None, None
+
+    logs = []
+    backend, _stem = print_with_ui(
+        "Pantum CM806ADN", make_case(copies=1), docx, logs.append,
+        timeout=20, desktop=FakeDesktop([window]), opener=opener, set_driver_attributes=False,
+    )
+    assert backend == "ui-automation"
+    assert window.remaining_failures == 0
+
+
+def test_print_button_waits_until_enabled(tmp_path, monkeypatch):
+    """预览还在渲染时“打印”按钮是禁用的：必须先等它可点击，否则点了等于没点。"""
+    from printcase import ui_print
+
+    monkeypatch.setattr(ui_print, "PRINT_START_TIMEOUT", 1.5)
+
+    class LazyButton(FakeButton):
+        def __init__(self, label, on_click, parent=None, disabled_polls=3):
+            super().__init__(label, on_click=on_click, parent=parent)
+            self.disabled_polls = disabled_polls
+            self.disabled_clicks = 0
+
+        def is_enabled(self) -> bool:
+            if self.disabled_polls > 0:
+                self.disabled_polls -= 1
+                return False
+            return True
+
+        def click_input(self) -> None:
+            if not self.is_enabled():
+                self.disabled_clicks += 1
+                return
+            super().click_input()
+
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    window = FakeWindow("报告.docx - Word", class_name="OpusApp")
+    combo = FakeCombo("打印机", ["打印机", "Pantum CM806ADN"])
+    combo.click_input = lambda: None
+    window.children.append(combo)
+
+    def on_click():
+        if combo in window.children:
+            window.children.remove(combo)
+
+    button = LazyButton("打印", on_click=on_click, parent=window, disabled_polls=3)
+
+    def opener(_path, _log):
+        return (lambda: None), "报告", None, None
+
+    logs = []
+    print_with_ui("Pantum CM806ADN", make_case(copies=1), docx, logs.append,
+                  timeout=20, desktop=FakeDesktop([window]), opener=opener, set_driver_attributes=False)
+
+    assert button.disabled_clicks == 0        # 从没在禁用状态下点击
+    assert combo not in window.children       # 点击生效，视图关闭

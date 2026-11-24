@@ -114,3 +114,57 @@ def test_restore_degrades_gracefully_without_write_access():
     ok = restore({"devmode": object()}, "Test Printer", w=FakeWin(), log=logs.append)
     assert ok is False
     assert any("手工核对" in m for m in logs)
+
+
+def _stub_snapshot(monkeypatch, value):
+    from printcase import driver_ui
+
+    monkeypatch.setattr(driver_ui, "snapshot", lambda printer, w=None: {"MediaType": value, "PaperSize": 9})
+
+
+def test_verify_allows_unchanged_when_target_already_selected(monkeypatch):
+    """目标纸张类型恰好等于驱动默认值（如普通纸=266）时，回读不变不能判失败。"""
+    from printcase import driver_ui
+
+    _stub_snapshot(monkeypatch, 266)
+    actions = [driver_ui.Action("纸张", "纸张类型", "combo_index", 0, "MediaType")]
+    before = {"MediaType": 266, "PaperSize": 9}
+
+    # 未声明“已是目标项”时仍按原逻辑拦截（保持严格）
+    assert driver_ui.verify("Test Printer", actions, before) == ["纸张类型：驱动默认值未变化（MediaType=266）"]
+    # 界面里本来就是目标项：DEVMODE 不变是正确结果
+    assert driver_ui.verify("Test Printer", actions, before, unchanged_labels={"纸张类型"}) == []
+
+
+def test_verify_still_rejects_invalid_value_when_unchanged(monkeypatch):
+    """即使界面已是目标项，回读值无效（0/空）仍需拦截。"""
+    from printcase import driver_ui
+
+    _stub_snapshot(monkeypatch, 0)
+    actions = [driver_ui.Action("纸张", "纸张类型", "combo_index", 0, "MediaType")]
+    problems = driver_ui.verify("Test Printer", actions, {"MediaType": 0}, unchanged_labels={"纸张类型"})
+    assert problems and "回读值无效" in problems[0]
+
+
+def test_combo_helpers_read_current_selection():
+    """自绘/不可读的下拉不能抛异常，应安全退化为 None / 空串。"""
+    from printcase import driver_ui
+
+    class Readable:
+        def selected_index(self):
+            return 2
+
+        def selected_text(self):
+            return "普通纸(60-90gsm)"
+
+    class Opaque:
+        def selected_index(self):
+            raise RuntimeError("not supported")
+
+        def selected_text(self):
+            raise RuntimeError("not supported")
+
+    assert driver_ui._combo_current_index(Readable()) == 2
+    assert driver_ui._combo_current_text(Readable()) == "普通纸(60-90gsm)"
+    assert driver_ui._combo_current_index(Opaque()) is None
+    assert driver_ui._combo_current_text(Opaque()) == ""

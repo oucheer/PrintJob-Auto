@@ -38,6 +38,8 @@ UI_PRINTABLE_EXTENSIONS = {".docx", ".doc", ".rtf", ".odt", ".wps", ".wpt"}
 PRINT_DIALOG_TITLES = ("打印", "print")
 PREFERENCE_BUTTON_WORDS = ("首选项", "属性", "preferences", "properties", "打印机属性", "高级")
 CONFIRM_BUTTON_WORDS = ("打印", "print")  # 优先真正的“打印”按钮，避免误点“确定”
+# 包含“打印”但绝不是提交按钮的控件文本（模糊匹配时排除）
+PRINT_BUTTON_NOISE = ("打印预览", "打印到文件", "print preview", "print to file")
 
 # 各属性的驱动界面标签关键字（中英文驱动常见写法）
 FIELD_LABELS = {
@@ -227,7 +229,6 @@ def _find_print_dialog_or_backstage(desktop, window, timeout: float):
     而不是独立对话框；WPS/旧版 Word 才是 #32770 对话框。两种都要支持。
     """
     deadline = time.monotonic() + timeout
-    last_error = ""
     while time.monotonic() < deadline:
         for candidate in desktop.windows():
             try:
@@ -238,34 +239,112 @@ def _find_print_dialog_or_backstage(desktop, window, timeout: float):
             if class_name == "#32770" and _matches_labels(text, PRINT_DIALOG_TITLES):
                 return candidate, False
         # 后台视图：主窗口内出现“选择打印机/打印机”下拉
-        if _backstage_printer_combo(window) is not None:
+        try:
+            combo = _backstage_printer_combo(window)
+        except Exception:  # noqa: BLE001 - Word 忙时 UIA 会抛 COMError，继续等
+            combo = None
+        if combo is not None:
             return window, True
         time.sleep(0.5)
-    raise UiPrintError(f"未能调出打印界面（Ctrl+P 后未出现“打印”对话框或后台打印视图）。{last_error}")
+    raise UiPrintError("未能调出打印界面（Ctrl+P 后未出现“打印”对话框或后台打印视图）。")
 
 
-def _find_print_dialog_or_backstage(desktop, window, timeout: float):
-    """返回 (容器, 是否后台视图)。
+# 调出打印界面的重试策略：Word 冷启动/焦点被抢时首次 Ctrl+P 常被吞掉，
+# 表现为“文档窗口已就绪”之后长时间没有任何反应，最后超时判失败。
+PRINT_VIEW_WAIT_PER_TRY = 8.0
+PRINT_VIEW_MAX_ATTEMPTS = 6
+BLOCKING_BANNER_WORDS = ("启用编辑", "enable editing", "启用内容", "enable content")
 
-    Word 2013+ 的 Ctrl+P 打开的是“打印”后台视图（嵌在主窗口内），
-    而不是独立对话框；WPS/旧版 Word 才是 #32770 对话框。两种都要支持。
+# 点击“打印”后的确认策略。Word 的后台打印视图在收到打印指令后会关闭并回到文档；
+# 如果点击没有被接受（按钮还在渲染、视图被遮挡），视图会一直停在原处。
+# 旧实现点完就当作“已提交”，0.8 秒后直接关 Word——作业还没进队列就被结束，
+# 表现为“日志说有 3 条，实际只出来 2 份”。
+PRINT_CLICK_ATTEMPTS = 2        # 点击后视图不关闭时，再点一次的上限
+PRINT_START_TIMEOUT = 6.0       # 单击后等打印视图关闭的时长
+PRINT_BUTTON_READY_TIMEOUT = 10.0  # 等“打印”按钮从禁用变为可点击（预览还在渲染）
+PRINT_CONFIRM_WAIT = 2.0        # 等 Word 报告后台打印任务的时长
+PRINT_DRAIN_TIMEOUT = 45.0      # 等 Word 把数据交给打印后台的上限
+PRINT_CLOSE_GRACE = 0.8         # 未确认时关闭前的固定等待
+_HANDOFF_LABELS = {
+    "handoff": "Word 后台打印任务已完成交接",
+    "none": "仅确认打印视图已关闭，未读到 Word 后台任务",
+    "dialog": "打印对话框已关闭",
+    "timeout": "等待 Word 后台任务超时",
+}
+
+
+def _dismiss_blocking_banner(window, log: Callable[[str], None] | None = None) -> bool:
+    """点掉“受保护的视图/启用编辑”一类横幅，否则键盘输入进不到正文。"""
+    for button in _descendants(window, control_type="Button"):
+        text = _text_of(button)
+        if not _matches_labels(text, BLOCKING_BANNER_WORDS):
+            continue
+        try:
+            button.click_input()
+        except Exception:  # noqa: WPS420
+            continue
+        if log:
+            log(f"文档窗口有“{text.strip()}”提示，已点击以恢复可编辑状态")
+        time.sleep(0.6)
+        return True
+    return False
+
+
+def _ensure_document_focus(window, log: Callable[[str], None] | None = None) -> bool:
+    """把焦点真正放到文档正文上；返回是否点进了正文。
+
+    Word 刚启动时焦点可能停在标题栏或加载中的窗格，此时 Ctrl+P 会被吞掉，
+    打印界面永远不出现。这里先激活窗口、清掉拦截横幅，再点一下正文。
     """
-    deadline = time.monotonic() + timeout
-    last_error = ""
-    while time.monotonic() < deadline:
-        for candidate in desktop.windows():
+    try:
+        window.set_focus()
+    except Exception:  # noqa: WPS420
+        pass
+    _dismiss_blocking_banner(window, log)
+    try:
+        window.set_focus()
+    except Exception:  # noqa: WPS420
+        pass
+    for control_type in ("Document", "Edit"):
+        for control in _descendants(window, control_type=control_type):
             try:
-                class_name = candidate.class_name()
+                if not _is_visible(control):
+                    continue
+                control.click_input()
+                return True
             except Exception:  # noqa: WPS420
-                class_name = ""
-            text = _text_of(candidate)
-            if class_name == "#32770" and _matches_labels(text, PRINT_DIALOG_TITLES):
-                return candidate, False
-        # 后台视图：主窗口内出现“选择打印机/打印机”下拉
-        if _backstage_printer_combo(window) is not None:
-            return window, True
-        time.sleep(0.5)
-    raise UiPrintError(f"未能调出打印界面（Ctrl+P 后未出现“打印”对话框或后台打印视图）。{last_error}")
+                continue
+    return False
+
+
+def _open_print_view(desktop, window, log: Callable[[str], None], timeout: float):
+    """反复尝试 Ctrl+P 直到打印界面出现；返回 (容器, 是否后台视图)。
+
+    单次尝试只等一小段，失败就重新聚焦再发一次 Ctrl+P，避免把一次被吞掉的
+    按键变成 90 秒空等 + 用例失败（批量下发时首条用例最容易踩到）。
+    """
+    deadline = time.monotonic() + max(1.0, timeout)
+    attempts = 0
+    last_error = ""
+    while attempts < PRINT_VIEW_MAX_ATTEMPTS and time.monotonic() < deadline:
+        attempts += 1
+        focused = _ensure_document_focus(window, log)
+        try:
+            window.type_keys("^p")
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"发送 Ctrl+P 失败：{type(exc).__name__}: {exc}"
+        wait_for = min(PRINT_VIEW_WAIT_PER_TRY, max(1.0, deadline - time.monotonic()))
+        log(f"已发送 Ctrl+P（第 {attempts} 次{f'，已聚焦正文' if focused else ''}），等待打印界面…")
+        try:
+            return _find_print_dialog_or_backstage(desktop, window, wait_for)
+        except UiPrintError as exc:
+            last_error = str(exc)
+            if time.monotonic() >= deadline:
+                break
+            log(f"第 {attempts} 次未出现打印界面，重新聚焦后重试")
+    raise UiPrintError(
+        f"未能调出打印界面（已尝试 {attempts} 次 Ctrl+P，仍未出现打印对话框或后台打印视图）。{last_error}"
+    )
 
 
 def _backstage_printer_combo(window):
@@ -280,18 +359,28 @@ def _backstage_printer_combo(window):
 
 def _select_printer_in_backstage(window, printer: str, log: Callable[[str], None]) -> bool:
     """后台视图选打印机：展开下拉 → 在列表项里点选目标驱动。"""
-    combo = _backstage_printer_combo(window)
+    try:
+        combo = _backstage_printer_combo(window)
+    except Exception as exc:  # noqa: BLE001 - Word 忙时 UIA 会抛 COMError
+        log(f"后台打印视图：读取打印机下拉失败（{type(exc).__name__}），稍后继续")
+        return False
     if combo is None:
         return False
     combo.click_input()
     time.sleep(0.6)
-    for container in (window,):
-        for item in _descendants(container, control_type="ListItem"):
-            text = _text_of(item)
-            if _norm(printer) and _norm(printer) in _norm(text):
+    try:
+        items = _descendants(window, control_type="ListItem")
+    except Exception:  # noqa: BLE001
+        items = []
+    for item in items:
+        text = _text_of(item)
+        if _norm(printer) and _norm(printer) in _norm(text):
+            try:
                 item.click_input()
-                log(f"后台打印视图：已选择打印机驱动 {text.strip() or printer}")
-                return True
+            except Exception:  # noqa: BLE001
+                continue
+            log(f"后台打印视图：已选择打印机驱动 {text.strip() or printer}")
+            return True
     log(f"后台打印视图：下拉中未找到 {printer}，无法保证作业发往目标打印机")
     return False
 
@@ -406,8 +495,134 @@ def _set_page_range(dialog, pages: str, log) -> None:
     raise UiPrintError(f"打印对话框里找不到“页码范围”输入框，无法保证按 {text} 打印。")
 
 
+def _button_enabled(button) -> bool:
+    """控件是否可点击；拿不到状态时按可点击处理（替身/旧引擎）。"""
+    checker = getattr(button, "is_enabled", None)
+    if checker is None:
+        return True
+    try:
+        return bool(checker())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _print_buttons(container) -> list[tuple[object, str]]:
+    """按“完全匹配优先”排序后返回 (按钮, 文本)。"""
+    exact = {_norm(word) for word in CONFIRM_BUTTON_WORDS}
+    ranked: list[tuple[int, object, str]] = []
+    try:
+        buttons = _descendants(container, control_type="Button")
+    except Exception:  # noqa: BLE001 - Word 忙时 UIA 会抛 COMError，交给调用方重试
+        return []
+    for button in buttons:
+        text = _text_of(button)
+        if _matches_labels(text, PRINT_BUTTON_NOISE):
+            continue
+        if _norm(text) in exact:
+            ranked.append((0, button, text))
+        elif _matches_labels(text, CONFIRM_BUTTON_WORDS):
+            ranked.append((1, button, text))
+    ranked.sort(key=lambda item: item[0])
+    return [(button, text) for _, button, text in ranked]
+
+
+def _click_print_button(container, log: Callable[[str], None],
+                        wait: float = PRINT_BUTTON_READY_TIMEOUT) -> str | None:
+    """点击“打印”按钮，返回实际点到的文本；找不到可点击的按钮返回 None。
+
+    后台打印视图刚切换过来时，“打印”按钮可能还是禁用状态（预览仍在渲染），
+    此时 click_input 不报错但也不生效——旧实现直接把这种情况记成“已提交”，
+    于是出现“日志 3 条、实际只出 2 份”。这里先等按钮真正可点击再点。
+    """
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        for button, text in _print_buttons(container):
+            if not _button_enabled(button):
+                continue
+            button.click_input()
+            return text
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def _print_view_gone(window) -> bool:
+    """后台打印视图是否已关闭（读 UIA 失败时按“还在视图里”处理，避免误判）。"""
+    try:
+        return _backstage_printer_combo(window) is None
+    except Exception:  # noqa: BLE001 - Word 忙时 UIA 会抛 COMError
+        return False
+
+
+def _left_print_view(window, timeout: float) -> bool:
+    """等 Word 后台打印视图关闭（回到文档）。
+
+    点击“打印”后视图一定会关闭；视图不动说明这次点击没有被接受，
+    此时把作业记成“已提交”就会丢单。判定“已关闭”后会再确认一次，
+    避免视图切换瞬间读不到控件被误判成“已关闭”。
+    """
+    deadline = time.monotonic() + max(0.5, float(timeout))
+    while time.monotonic() < deadline:
+        if _print_view_gone(window):
+            time.sleep(0.4)
+            if _print_view_gone(window):
+                return True
+            continue                      # 只是瞬时读不到，继续等
+        time.sleep(0.15)
+    return _print_view_gone(window)
+
+
+def _background_print_status(app) -> int | None:
+    """Word 的 Application.BackgroundPrintingStatus（后台打印任务数）；读不到返回 None。"""
+    if app is None:
+        return None
+    try:
+        return int(app.BackgroundPrintingStatus)
+    except Exception:  # noqa: BLE001 - WPS/旧版 Word 没有该属性，或 Word 忙时拒绝调用
+        return None
+
+
+def _confirm_print_handoff(app, log: Callable[[str], None],
+                           confirm_wait: float = PRINT_CONFIRM_WAIT,
+                           drain_timeout: float = PRINT_DRAIN_TIMEOUT) -> str:
+    """确认 Word 真的把作业交给了打印后台；返回 handoff / none。
+
+    点击“打印”后 Word 会开一个后台打印任务。这里等它出现再等它落盘完成，
+    确认之后才允许关闭文档——否则 Word 被提前结束会把作业一起带走。
+    """
+    if app is None:
+        time.sleep(PRINT_CLOSE_GRACE)
+        return "none"
+
+    deadline = time.monotonic() + max(0.5, confirm_wait)
+    status = None
+    while time.monotonic() < deadline:
+        status = _background_print_status(app)
+        if status is None:
+            time.sleep(0.1)          # Word 忙（刚点完打印），稍后重试而不是立刻放弃
+            continue
+        if status > 0:
+            log(f"Word 已接收打印指令（后台打印任务 {status} 个），等待其交给打印后台…")
+            drain_deadline = time.monotonic() + max(1.0, drain_timeout)
+            while time.monotonic() < drain_deadline:
+                status = _background_print_status(app)
+                if status is None or status == 0:
+                    log("Word 后台打印任务已全部交给打印后台，可以关闭文档")
+                    return "handoff"
+                time.sleep(0.2)
+            log(f"Word 后台打印任务在 {drain_timeout:.0f} 秒内未结束，按已提交处理")
+            return "handoff"
+        time.sleep(0.1)
+
+    if status is None:
+        log("读取 Word 后台打印状态失败（文档可能已被驱动瞬间接手），按视图关闭确认结果")
+    else:
+        log("Word 未报告后台打印任务（作业可能已被驱动瞬间接手），关闭文档后按队列确认")
+    return "none"
+
+
 def _open_document_visible(doc_path: Path, log: Callable[[str], None]):
-    """用 Word（优先）或 WPS 以可见方式打开文档，返回 (关闭函数, 窗口标题)。"""
+    """用 Word（优先）或 WPS 以可见方式打开文档，返回 (关闭函数, 窗口标题, 文档对象, 应用对象)。"""
     import pythoncom  # noqa: WPS433
 
     pythoncom.CoInitialize()
@@ -459,7 +674,7 @@ def _open_document_visible(doc_path: Path, log: Callable[[str], None]):
             pass
         pythoncom.CoUninitialize()
 
-    return close, doc_path.stem, document
+    return close, doc_path.stem, document, app
 
 
 def _default_opener(doc_path: Path, log: Callable[[str], None]):
@@ -684,6 +899,7 @@ def print_with_ui(
         opened = opener(source_path, log)
         close_app, title = opened[0], opened[1]
         document = opened[2] if len(opened) > 2 else None
+        app = opened[3] if len(opened) > 3 else None
 
         # 扩展属性：WPS 页面布局（必须在调出打印对话框前设置，影响分页）
         wps_attrs = [attr for attr in (case.extended_attrs or []) if attr.page == "wps_page"]
@@ -696,11 +912,8 @@ def print_with_ui(
 
         window = _find_window(desktop, title, timeout)
         log(f"文档窗口已就绪：{_text_of(window) or title}")
-        window.set_focus()
-        window.type_keys("^p")
-        log("已发送 Ctrl+P，等待打印对话框…")
 
-        container, backstage = _find_print_dialog_or_backstage(desktop, window, timeout)
+        container, backstage = _open_print_view(desktop, window, log, timeout)
         log("打印界面已就绪（%s），开始选择打印机驱动" % ("后台打印视图" if backstage else "打印对话框"))
         if backstage:
             _select_printer_in_backstage(window, printer, log)
@@ -733,32 +946,45 @@ def print_with_ui(
                 + "、".join(unresolved)
             )
 
-        clicked = False
-        buttons = _descendants(container, control_type="Button")
-        # 先找文字完全等于“打印/Print”的按钮（避免点到“打印预览”“打印到文件”）
-        for button in buttons:
-            if _norm(_text_of(button)) in {_norm(word) for word in CONFIRM_BUTTON_WORDS}:
-                button.click_input()
-                log(f"已点击“{_text_of(button)}”，打印作业已提交")
-                clicked = True
-                break
-        if not clicked:
-            for button in buttons:
-                if _matches_labels(_text_of(button), CONFIRM_BUTTON_WORDS):
-                    button.click_input()
-                    log(f"已点击“{_text_of(button)}”，打印作业已提交")
-                    clicked = True
+        clicked_text = None
+        for attempt in range(1, PRINT_CLICK_ATTEMPTS + 1):
+            clicked_text = _click_print_button(container, log)
+            if clicked_text is None:
+                if backstage and _print_view_gone(window):
+                    # 按钮已经随视图消失：说明上一轮点击其实生效了
+                    clicked_text = "打印"
+                    log("打印视图已自行关闭（上一轮点击已生效）")
                     break
-        if not clicked:
-            raise UiPrintError("打印界面里找不到“打印”按钮。")
+                raise UiPrintError(
+                    "打印界面里没有可点击的“打印”按钮（可能仍在渲染或已被禁用），无法确认作业已提交。"
+                )
+            if not backstage:
+                log(f"已点击“{clicked_text}”，等待打印对话框关闭")
+                break
+            log(f"已点击“{clicked_text}”（第 {attempt} 次），等待打印视图关闭…")
+            if _left_print_view(window, PRINT_START_TIMEOUT):
+                log("打印视图已关闭，Word 已接受打印指令")
+                break
+            if attempt < PRINT_CLICK_ATTEMPTS:
+                log(f"点击后 {PRINT_START_TIMEOUT:.0f} 秒内打印视图仍未关闭，重新点击“打印”")
+        else:
+            raise UiPrintError(
+                f"已点击“{clicked_text}”但打印视图始终未关闭，Word 没有接受打印指令；"
+                "为避免“日志显示已提交、实际没有出纸”，本次不下发，请重试。"
+            )
+
+        if backstage:
+            outcome = _confirm_print_handoff(app, log)
+        else:
+            outcome = "dialog"
 
         if not backstage:
             _wait(lambda: not _is_visible(container), 20, "打印对话框在 20 秒内未关闭，无法确认作业已提交。")
+        log(f"打印作业已提交给打印端（确认方式：{_HANDOFF_LABELS.get(outcome, outcome)}）")
         return "ui-automation", source_path.stem
     finally:
         if close_app is not None:
             try:
-                time.sleep(0.8)
                 close_app()
                 log("已关闭文档并退出打印组件")
             except Exception:  # noqa: WPS420

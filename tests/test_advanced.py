@@ -469,6 +469,9 @@ def test_probe_is_extension_aware():
 
 # ---------- 模板下拉框（数据有效性） ----------
 
+from xlsx_dv import read_validations as _read_validations  # noqa: E402  数据验证读取（含 x14 扩展）
+
+
 def _options_from_formula(wb, formula: str) -> list[str]:
     """把 DV 的 formula1（选项表范围或 IF 公式）解析成可选值列表。"""
     import re as _re
@@ -494,7 +497,7 @@ def test_template_has_dropdowns_for_enum_columns():
     ws = wb["用例"]
     headers = [cell.value for cell in ws[1]]
     dv_by_col = {}
-    for dv in ws.data_validations.dataValidation:
+    for dv in _read_validations(template, "用例"):
         for cell_range in str(dv.sqref).split():
             column = "".join(ch for ch in cell_range.split(":")[0] if ch.isalpha())
             dv_by_col[column] = dv
@@ -652,7 +655,7 @@ def test_template_matches_driver_dropdown_options():
 
     ws = wb["用例"]
     headers = [c.value for c in ws[1]]
-    formulas = {str(dv.sqref): dv.formula1 for dv in ws.data_validations.dataValidation}
+    formulas = {str(dv.sqref): dv.formula1 for dv in _read_validations(template, "用例")}
     # 所有列表校验都引用隐藏的“选项”表（避免 255 字符上限）
     assert all("选项!" in str(f) for f in formulas.values() if str(f) != "1" and str(f) != "10")
     # 混合尺寸是独立开关列，紧跟在纸张之后

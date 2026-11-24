@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -14,7 +15,7 @@ class AuditStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as con:
+        with self._session() as con:
             con.execute("""
                 CREATE TABLE IF NOT EXISTS print_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,8 +39,22 @@ class AuditStore:
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
+    @contextmanager
+    def _session(self):
+        """一次读写会话：结束即关闭连接。
+
+        只用 ``with sqlite3.connect()`` 不会关闭连接，长跑时会累积句柄，
+        而且 db/WAL 文件一直被占用（导出、清理、测试临时目录都会撞锁）。
+        """
+        con = self._connect()
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
+
     def save(self, run_id: str, result: CaseResult) -> None:
-        with self._connect() as con:
+        with self._session() as con:
             con.execute("""
                 INSERT INTO print_results (
                     run_id, case_id, source_file, printer, status, message, job_id,
@@ -55,20 +70,7 @@ class AuditStore:
 
     def recent(self, limit: int = 500) -> list[dict]:
         """按时间倒序返回最近的历史执行记录（供界面历史页展示）。"""
-        with self._connect() as con:
-            cursor = con.execute("""
-                SELECT started_at, run_id, case_id, status, printer, job_id,
-                       elapsed_seconds, source_file, message
-                FROM print_results
-                ORDER BY id DESC
-                LIMIT ?
-            """, (limit,))
-            columns = [c[0] for c in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-    def recent(self, limit: int = 500) -> list[dict]:
-        """按时间倒序返回最近的历史执行记录（供界面历史页展示）。"""
-        with self._connect() as con:
+        with self._session() as con:
             cursor = con.execute("""
                 SELECT started_at, run_id, case_id, status, printer, job_id,
                        elapsed_seconds, source_file, message

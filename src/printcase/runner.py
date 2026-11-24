@@ -11,15 +11,22 @@ from typing import Callable
 
 from .audit import AuditStore
 from .direct_print import DirectPrintError, print_with_driver
-from .driver_ui import DriverUiError, apply_case
+from .driver_ui import DriverUiError, apply_case, close_stale_preferences
 from .models import CaseResult, CaseStatus, PrintCase
 from .office import DocumentConversionError
+from .queue_watch import ERROR_JOB_MASKS, QueueWatcher
 from .ui_print import UI_PRINTABLE_EXTENSIONS, UiPrintError, print_with_ui
 from .separator import create_case_separator_pdf
 from .validator import normalize_paper, validate_case
 
 
-ERROR_JOB_MASKS = ("打印错误", "打印机离线", "缺纸", "作业已暂停", "驱动阻止作业", "需要人工干预")
+# 关联队列作业的等待上限：作业在下发后通常 1-3 秒内进入队列，没必要按用例
+# 超时（默认 90s）整段空等——那会让“未关联”的用例白等一整轮。
+CORRELATE_TIMEOUT_CAP = 20.0
+
+# 打开驱动属性页前，等上一轮作业离开队列的最长时间。停止/中断后立刻重开属性页，
+# 驱动常常还在收尾：printui 会静默退出，一个窗口都不建。
+QUEUE_SETTLE_TIMEOUT = 6.0
 
 
 class PrintRunner:
@@ -44,6 +51,7 @@ class PrintRunner:
         document_converter: Callable[..., Path] | None = None,
         driver_applier: Callable[..., Callable[[], None]] | None = None,
         ui_submitter: Callable[..., tuple[str, str]] | None = None,
+        queue_watcher_factory: Callable[..., QueueWatcher] | None = None,
     ) -> None:
         self.spooler = spooler
         self.audit = audit
@@ -52,7 +60,30 @@ class PrintRunner:
         self.submit = submitter or self._default_submit
         self.driver_applier = driver_applier or apply_case
         self.ui_submitter = ui_submitter or self._default_ui_submit
+        self.queue_watcher_factory = queue_watcher_factory or (lambda reader: QueueWatcher(reader))
         self.stop_event = threading.Event()
+        # 本轮是否已经清理过“上一轮中断留下的驱动属性页”
+        self._driver_ui_reset = False
+        # 上一件事是否真的向队列提交过作业（决定下一件事前要不要等队列收尾）
+        self._submitted_since_idle = False
+
+    def _make_watcher(self, printer: str, log: Callable[[str], None] | None = None) -> QueueWatcher | None:
+        """后台队列监视器；不支持高频监视的替身（测试用）返回 None，走同步轮询。"""
+        if not getattr(self.spooler, "supports_queue_watch", False):
+            return None
+        try:
+            watcher = self.queue_watcher_factory(lambda: self.spooler.get_jobs(printer))
+            printed_mask = getattr(getattr(self.spooler, "win32print", None), "JOB_STATUS_PRINTED", 0)
+            if printed_mask:
+                watcher._printed_mask = printed_mask  # noqa: WPS437 - 注入驱动“已打印”状态位
+            watcher.start()
+            if not watcher.wait_ready(1.5) and log:
+                log("队列监视器 1.5 秒内没有完成首次采样，队列关联可能不准")
+            return watcher
+        except Exception as exc:  # noqa: BLE001 - 监视器不可用时退回同步轮询
+            if log:
+                log(f"队列监视器启动失败，改用同步轮询：{type(exc).__name__}: {exc}")
+            return None
 
     def _default_submit(self, printer: str, job_case: PrintCase, source_path: Path, log: Callable[[str], None], temp_dir: Path) -> tuple[str, str]:
         return print_with_driver(
@@ -80,6 +111,52 @@ class PrintRunner:
     def stop(self) -> None:
         self.stop_event.set()
 
+    # ---------- 驱动属性页的残留清理与队列收尾 ----------
+    def _uses_real_driver_ui(self) -> bool:
+        """只有真实驱动属性页通道才需要清理桌面残留（替身注入时跳过）。"""
+        return self.driver_applier is apply_case
+
+    def _reset_driver_ui(self, printer: str, emit: Callable[[str], None]) -> None:
+        """每轮第一次设置属性前，先清掉上一轮停止/失败留下的属性页窗口与进程。"""
+        if not self._uses_real_driver_ui():
+            return
+        try:
+            cleared = close_stale_preferences(printer, log=emit)
+        except Exception as exc:  # noqa: BLE001
+            emit(f"清理上一轮残留的驱动属性页失败：{type(exc).__name__}: {exc}")
+            return
+        if cleared:
+            emit(f"已清理上一轮残留的驱动属性页窗口/进程（{cleared} 项）")
+
+    def _wait_queue_settled(self, printer: str, emit: Callable[[str], None]) -> None:
+        """等上一个作业离开队列再打开驱动属性页。
+
+        作业还在队列里时驱动仍在收尾，此时 printui 常常直接静默退出，
+        表现为“属性页窗口未出现”。最多等 QUEUE_SETTLE_TIMEOUT 秒，等不到也照常继续。
+        """
+        if not self._submitted_since_idle or not getattr(self.spooler, "supports_queue_watch", False):
+            return
+        self._submitted_since_idle = False
+        started = time.monotonic()
+        announced = False
+        while time.monotonic() - started < QUEUE_SETTLE_TIMEOUT:
+            try:
+                jobs = self.spooler.get_jobs(printer)
+            except Exception:  # noqa: BLE001
+                return
+            if not jobs:
+                elapsed = time.monotonic() - started
+                if announced:
+                    emit(f"打印队列已清空（等待 {elapsed:.1f} 秒），继续设置驱动属性")
+                return
+            if not announced:
+                names = "、".join(f"#{job.job_id}" for job in jobs[:3])
+                emit(f"打印机队列仍有 {len(jobs)} 个作业（{names}）在处理，等其离开队列后再打开驱动属性页")
+                announced = True
+            if self.stop_event.wait(0.4):
+                return
+        emit(f"打印队列在 {QUEUE_SETTLE_TIMEOUT:.0f} 秒内未清空，仍继续设置驱动属性（属性页可能被驱动暂时拒绝打开）")
+
     def run_cases(
         self,
         cases: list[PrintCase],
@@ -88,6 +165,8 @@ class PrintRunner:
         on_event: Callable[[str, object], None],
     ) -> list[CaseResult]:
         self.stop_event.clear()
+        self._driver_ui_reset = False
+        self._submitted_since_idle = False
         results: list[CaseResult] = []
         printers = set(self.spooler.list_printers())
         for case in cases:
@@ -163,6 +242,10 @@ class PrintRunner:
                 emit(f"无法读取打印机状态：{status_error}")
 
             # 步骤 1/4：在驱动属性页里设置用例属性（设置后只读回读默认 DEVMODE 校验）
+            if not self._driver_ui_reset:
+                self._driver_ui_reset = True
+                self._reset_driver_ui(printer, emit)
+            self._wait_queue_settled(printer, emit)
             emit("步骤 1/4：打开驱动“打印首选项”，按用例设置纸张尺寸/纸张类型/来源/双面/颜色/份数")
             caps = None
             try:
@@ -196,8 +279,14 @@ class PrintRunner:
             emit(f"步骤 2/4：打开打印文档 {source_path.name}")
             emit(f"步骤 3/4：选择打印机 {printer} 并按用例属性下发")
             baseline = {job.job_id for job in self.spooler.get_jobs(printer)}
+            # 队列监视器必须在提交之前启动：作业在队列里可能只存活几百毫秒
+            watcher = self._make_watcher(printer, emit)
+            known_ids = set(baseline)
+            if watcher is not None:
+                known_ids |= watcher.snapshot_ids()
             try:
                 submit_result = self._submit_case(printer, job_case, source_path, emit, temp_dir)
+                self._submitted_since_idle = True
                 backend, doc_stem = submit_result[0], submit_result[1]
                 job_hint = submit_result[2] if len(submit_result) > 2 else None
                 if job_hint:
@@ -225,7 +314,15 @@ class PrintRunner:
             result.settings["backend"] = backend
             emit(f"步骤 3/4 完成：作业已通过 {backend} 通道提交，开始监视打印队列")
 
-            self._await_queue_result(printer, baseline, doc_stem, case, result, job_hint=job_hint)
+            try:
+                self._await_queue_result(
+                    printer, baseline, doc_stem, case, result, job_hint=job_hint,
+                    watcher=watcher, known_ids=known_ids,
+                    notify=lambda: on_event("result", result),
+                )
+            finally:
+                if watcher is not None:
+                    watcher.stop()
 
             if each_copy_mode and result.status != CaseStatus.STOPPED:
                 self._print_remaining_copies(case, printer, on_event, temp_dir, source_path, caps, emit)
@@ -244,6 +341,10 @@ class PrintRunner:
                     restore_driver()
                 except Exception as restore_error:
                     emit(f"驱动默认设置还原失败，请在驱动首选项中手工核对：{restore_error}")
+            if self.stop_event.is_set() or result.status in {CaseStatus.FAILED, CaseStatus.STOPPED}:
+                # 停止/失败后驱动属性页可能还挂在桌面上（甚至已经卡死），
+                # 不清掉的话下一次下发会“属性页窗口未出现”。
+                self._reset_driver_ui(printer, emit)
             if temp_dir is not None:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             result.ended_at = datetime.now()
@@ -253,14 +354,18 @@ class PrintRunner:
 
     def _await_queue_result(
         self, printer: str, baseline: set, doc_stem: str, case: PrintCase, result: CaseResult,
-        job_hint: int | None = None,
+        job_hint: int | None = None, watcher=None, known_ids: set | None = None, notify=None,
     ) -> None:
         """在 Windows 打印队列里关联并跟踪本次作业，直到到达可观察的终态。
 
-        阶段一：按文件主干关联队列作业（超时窗口 = 用例超时秒）。
-        阶段二：跟踪已关联作业直到驱动报告打印/队列清除/出错（窗口 = queue_timeout）。
+        有后台监视器时以它的留档为准（不会漏掉几百毫秒的短命作业）；
+        没有时退回同步轮询（测试替身/监视器不可用），并给关联等待设上限。
         """
-        # 优先按 StartDoc 返回的作业号直接关联（作业瞬间完成时按名称会错过）
+        if watcher is not None:
+            self._await_with_watcher(doc_stem, case, result, job_hint, watcher, known_ids or set(), notify)
+            return
+
+        # ---------- 同步轮询（无后台监视器） ----------
         seen_job = None
         if job_hint:
             probe_deadline = time.monotonic() + 3
@@ -283,8 +388,8 @@ class PrintRunner:
                 return
 
         # 阶段一：按作业名关联（驱动未返回作业号时使用）
-
-        correlate_deadline = time.monotonic() + case.timeout_seconds
+        correlate_window = max(3.0, min(float(case.timeout_seconds or 90), CORRELATE_TIMEOUT_CAP))
+        correlate_deadline = time.monotonic() + correlate_window
         while time.monotonic() < correlate_deadline:
             if self.stop_event.is_set():
                 result.status = CaseStatus.STOPPED
@@ -312,11 +417,17 @@ class PrintRunner:
                 result.status = CaseStatus.SUBMITTED_UNVERIFIED
                 result.message = "发现多个名称匹配的队列作业，无法安全判断归属；请人工核对，不建议自动重试。"
                 return
-            time.sleep(0.4)
+            if len(new_jobs) == 1:
+                seen_job = new_jobs[0]
+                break
+            time.sleep(0.12)
 
         if seen_job is None:
             result.status = CaseStatus.SUBMITTED_UNVERIFIED
-            result.message = "作业已提交，但未能在队列中关联到作业；请人工检查打印机队列，不建议自动重试。"
+            result.message = (
+                f"作业已提交，但在 {correlate_window:.0f} 秒监视窗口内未捕获到队列作业记录"
+                "（驱动可能直接送打印机，或作业瞬间完成）；这不能证明纸张实际输出。"
+            )
             return
 
         result.job_id = seen_job.job_id
@@ -338,7 +449,7 @@ class PrintRunner:
                 result.status = CaseStatus.TIMEOUT_QUEUED
                 result.message = f"作业 #{seen_job.job_id} 仍在队列中，等待超过监控窗口；请检查打印机面板及队列。"
                 return
-            time.sleep(0.75)
+            time.sleep(0.25)
             try:
                 jobs = self.spooler.get_jobs(printer)
             except Exception as spool_error:
@@ -351,6 +462,85 @@ class PrintRunner:
                 return
             seen_job = current
             result.message = f"作业 #{current.job_id}：{current.status_text}（已打印页 {current.pages_printed}/{current.total_pages or '?'}）"
+
+    # ---------- 有后台监视器时的关联与跟踪 ----------
+    def _await_with_watcher(self, doc_stem: str, case: PrintCase, result: CaseResult,
+                            job_hint: int | None, watcher, known_ids: set, notify) -> None:
+        def push() -> None:
+            if notify is not None:
+                try:
+                    notify()
+                except Exception:  # noqa: WPS420
+                    pass
+
+        job = None
+        if job_hint:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                observation = watcher.observation(int(job_hint))
+                if observation is not None:
+                    job = observation.job
+                    break
+                if self.stop_event.wait(0.05):
+                    break
+            if job is None:
+                result.status = CaseStatus.SUBMITTED_UNVERIFIED
+                result.message = (
+                    f"Windows 打印队列已分配作业号 #{job_hint}，但作业在监视窗口内已完成或已清除；"
+                    "这不能证明纸张实际输出。"
+                )
+                push()
+                return
+        else:
+            result.message = "作业已提交，正在关联打印队列…"
+            push()
+            window = max(3.0, min(float(case.timeout_seconds or 90), CORRELATE_TIMEOUT_CAP))
+            outcome = watcher.wait_for_new(
+                known_ids, window, doc_stem, should_stop=self.stop_event.is_set,
+            )
+            if outcome.note == "stopped":
+                result.status = CaseStatus.STOPPED
+                result.message = "下发过程中收到停止请求；请检查打印队列，不能假定作业已撤回。"
+                push()
+                return
+            if outcome.job is None:
+                result.status = CaseStatus.SUBMITTED_UNVERIFIED
+                health = watcher.health_text()
+                if outcome.ambiguous:
+                    result.message = "打印队列中同时出现多个新作业，无法安全判断归属；请人工核对，不建议自动重试。"
+                else:
+                    result.message = (
+                        f"作业已提交，但在 {window:.0f} 秒监视窗口内未捕获到队列作业记录"
+                        f"（驱动可能直接送打印机，或作业瞬间完成）；队列{health}。这不能证明纸张实际输出。"
+                    )
+                push()
+                return
+            job = outcome.job
+
+        result.job_id = job.job_id
+        result.status = CaseStatus.QUEUED
+        result.message = f"已关联 Windows 作业 #{job.job_id}：{job.status_text}"
+        push()
+
+        kind, last = watcher.wait_terminal(
+            job.job_id, self.queue_timeout, should_stop=self.stop_event.is_set,
+        )
+        if kind == "printed":
+            result.status = CaseStatus.DRIVER_PRINTED
+            result.message = "Windows 驱动报告作业已打印；不等同于人工确认纸张实际出纸。"
+        elif kind == "error":
+            result.status = CaseStatus.FAILED
+            result.message = f"打印队列异常：{(last.status_text if last else '未知错误')}"
+        elif kind == "gone":
+            result.status = CaseStatus.QUEUE_CLEARED
+            result.message = f"Windows 队列中已找不到作业 #{job.job_id}；这只能证明队列已清除，不能证明纸张实际输出。"
+        elif kind == "stopped":
+            result.status = CaseStatus.STOPPED
+            result.message = "下发过程中收到停止请求；请检查打印队列，不能假定作业已撤回。"
+        else:
+            result.status = CaseStatus.TIMEOUT_QUEUED
+            result.message = f"作业 #{job.job_id} 仍在队列中，等待超过监控窗口；请检查打印机面板及队列。"
+        push()
 
     def _print_separator_page(self, case: PrintCase, printer: str, on_event: Callable[[str, object], None], position: str, temp_dir: Path, caps=None, emit=None) -> None:
         """在主作业之前/之后插打一张分隔页；分隔页失败只记录，不影响主用例状态。"""

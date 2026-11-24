@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from xlsx_dv import read_validations
+
 from printcase.attr_catalog import ATTRIBUTE_BY_LABEL, ATTRIBUTES, LEGACY_COLUMN_PAGES, page_display
 from printcase.extended_attrs import (
     ExtendedAttr,
@@ -133,7 +135,7 @@ def test_template_ships_extended_attribute_sheet_with_dropdowns():
     ws = wb["驱动扩展属性"]
     headers = [cell.value for cell in ws[1]]
     assert headers == ["用例编号", "页面", "属性", "值", "说明"]
-    dv_ranges = {str(dv.sqref): dv for dv in ws.data_validations.dataValidation}
+    dv_ranges = {dv.sqref.strip(): dv for dv in read_validations(template, "驱动扩展属性")}
     assert "B2:B500" in dv_ranges and "C2:C500" in dv_ranges
     assert all(dv.type == "list" and not dv.showDropDown for dv in dv_ranges.values())
 

@@ -7,6 +7,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
@@ -16,6 +17,7 @@ from .excel_reader import read_cases
 from .models import CaseResult, CaseStatus, PrintCase
 from .office import OFFICE_EXTENSIONS, probe_document_converter
 from .runner import PrintRunner
+from .runlog import RunLog
 from .spooler import WindowsSpooler
 from .appinfo import app_base_dir
 from .validator import validate_case
@@ -38,16 +40,89 @@ def data_dir() -> Path:
     return path
 
 
+class HoverTip:
+    """鼠标悬停显示完整文本的浮动提示。
+
+    ttk.Treeview 的单元格不能换行，长文本（尤其是“结果 / 诊断”）一定会被列宽
+    截断。这里在悬停时把完整内容浮层显示，并按屏幕边缘自动翻转位置，不改变
+    表格布局；双击行还会打开完整详情窗口。
+    """
+
+    def __init__(self, widget: tk.Misc, wraplength: int = 620, delay: int = 320) -> None:
+        self.widget = widget
+        self.wraplength = wraplength
+        self.delay = delay
+        self._after: str | None = None
+        self._tip: tk.Toplevel | None = None
+        self._text = ""
+
+    def schedule(self, text: str, x_root: int, y_root: int) -> None:
+        text = str(text or "").strip()
+        if not text:
+            self.hide()
+            return
+        if self._tip is not None and text == self._text:
+            return  # 同一单元格内移动，保持当前提示
+        self.hide()
+        self._text = text
+        self._after = self.widget.after(self.delay, lambda: self._show(text, x_root, y_root))
+
+    def _show(self, text: str, x_root: int, y_root: int) -> None:
+        self._after = None
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        label = tk.Label(
+            tip, text=text, justify="left", anchor="w", wraplength=self.wraplength,
+            bg="#FFFDF2", fg=INK, relief="solid", bd=1,
+            font=("Microsoft YaHei UI", 9), padx=10, pady=8,
+        )
+        label.pack()
+        tip.update_idletasks()
+        width, height = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        screen_w, screen_h = tip.winfo_screenwidth(), tip.winfo_screenheight()
+        x = min(max(8, x_root + 18), max(8, screen_w - width - 10))
+        y = y_root + 20
+        if y + height > screen_h - 10:
+            y = max(8, y_root - height - 14)
+        tip.wm_geometry(f"+{x}+{y}")
+        self._tip = tip
+
+    def hide(self) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:  # noqa: BLE001
+                pass
+            self._after = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._tip = None
+        self._text = ""
+
+
 class PrintCaseApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"PrintCase Studio · Excel 打印用例执行平台 v{__version__}")
-        self.root.geometry("1380x860")
-        self.root.minsize(1100, 720)
+        # 按屏幕可用区域自适应：1280×720 / 1366×768 这类小屏不会把右侧按钮挤出窗口
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        width = max(1024, min(1380, screen_w - 40))
+        height = max(680, min(860, screen_h - 80))
+        self.root.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+{max(0, (screen_h - height) // 2)}")
+        self.root.minsize(min(1024, width), min(680, height))
         self.root.configure(bg=BG)
 
         self.cases: list[PrintCase] = []
         self.checked: set[int] = set()
+        self.select_all_var = tk.BooleanVar(value=False)
         self.case_results: dict[str, CaseResult] = {}
         self.run_results: list[CaseResult] = []
         self.run_id = ""
@@ -58,6 +133,8 @@ class PrintCaseApp:
         self.worker: threading.Thread | None = None
         self.running = False
         self.audit = AuditStore(data_dir() / "history.sqlite3")
+        self.run_log: RunLog | None = None
+        self.log_path: Path | None = None
 
         self._setup_style()
         self._build_ui()
@@ -105,7 +182,7 @@ class PrintCaseApp:
         ("ext_attrs", "扩展属性", 72, "center"),
         ("status", "执行状态", 148, "w"),
         ("time", "耗时", 56, "w"),
-        ("message", "结果 / 诊断", 230, "w"),
+        ("message", "结果 / 诊断", 320, "w"),
     ]
 
 
@@ -168,10 +245,15 @@ class PrintCaseApp:
         self._build_log_page(self.page_frames["log"])
         self._build_history_page(self.page_frames["history"])
         self._build_help_page(self.page_frames["help"])
+        self._install_fulltext_helpers()
         self._show_page("console")
 
     def _show_page(self, key: str) -> None:
         """左侧导航切换右侧功能页，并同步高亮。"""
+        try:
+            self.tip.hide()
+        except Exception:  # noqa: BLE001
+            pass
         self.page_frames[key].tkraise()
         titles = {"console": "打印执行", "log": "执行日志", "history": "执行历史", "help": "使用帮助"}
         self.page_title.configure(text=titles.get(key, key))
@@ -235,7 +317,24 @@ class PrintCaseApp:
         tk.Label(table_header, text="用例队列", bg=PANEL, fg=INK, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
         self.case_count_label = tk.Label(table_header, text="0 条", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9))
         self.case_count_label.pack(side="left", padx=(8, 0))
+        self.select_all_check = tk.Checkbutton(
+            table_header,
+            text="全选",
+            variable=self.select_all_var,
+            command=self._toggle_all_from_checkbox,
+            bg=PANEL,
+            fg=INK,
+            activebackground=PANEL,
+            activeforeground=INK,
+            selectcolor="white",
+            font=("Microsoft YaHei UI", 9),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.select_all_check.pack(side="left", padx=(16, 0))
         ttk.Button(table_header, text="导出本次报告", command=self._export_report).pack(side="right")
+        ttk.Button(table_header, text="自适应列宽", command=self._autosize_console_columns).pack(side="right", padx=(0, 8))
 
         tree_area = tk.Frame(left, bg=PANEL)
         tree_area.pack(fill="both", expand=True, padx=10, pady=(0, 8))
@@ -259,6 +358,8 @@ class PrintCaseApp:
         self.tree.tag_configure("good", foreground=GREEN)
         self.tree.tag_configure("muted", foreground=MUTED)
         self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Button-3>", self._on_tree_context_menu)
 
         footer = tk.Frame(body, bg=BG)
         footer.pack(fill="x", pady=(8, 0))
@@ -271,6 +372,7 @@ class PrintCaseApp:
         bar = tk.Frame(page, bg=PANEL, highlightbackground="#E2E9F1", highlightthickness=1)
         bar.pack(fill="x")
         tk.Label(bar, text="实时事件 · 队列反馈 · 故障提示", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 0), pady=8)
+        ttk.Button(bar, text="打开日志目录", command=self._open_log_dir).pack(side="right", padx=6, pady=6)
         ttk.Button(bar, text="清空日志", command=self._clear_log).pack(side="right", padx=10, pady=6)
         self.log_text = tk.Text(page, bg="#F7F9FC", fg="#44566D", wrap="word", relief="flat", font=("Consolas", 10), padx=14, pady=12, state="disabled")
         self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -286,6 +388,7 @@ class PrintCaseApp:
         bar.pack(fill="x")
         tk.Label(bar, text="历史执行记录（按时间倒序，最多 500 条）", bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 0), pady=8)
         ttk.Button(bar, text="刷新历史", command=self._refresh_history).pack(side="right", padx=10, pady=6)
+        ttk.Button(bar, text="自适应列宽", command=self._autosize_history_columns).pack(side="right", pady=6)
 
         area = tk.Frame(page, bg=PANEL)
         area.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -307,6 +410,10 @@ class PrintCaseApp:
         self.history_tree.tag_configure("bad", foreground=RED)
         self.history_tree.tag_configure("good", foreground=GREEN)
         self.history_tree.tag_configure("muted", foreground=MUTED)
+        self.history_tree.bind("<Double-1>", self._on_history_double_click)
+        self.history_tree.bind("<Button-3>", self._on_history_context_menu)
+        self.history_headings = headings
+        self.history_columns = columns
 
     def _refresh_history(self) -> None:
         for item in self.history_tree.get_children():
@@ -483,6 +590,10 @@ class PrintCaseApp:
     }
 
     def _render_cases(self) -> None:
+        try:
+            self.tip.hide()
+        except Exception:  # noqa: BLE001
+            pass
         for item in self.tree.get_children():
             self.tree.delete(item)
         labels = self._CASE_LABELS
@@ -527,6 +638,7 @@ class PrintCaseApp:
                 message,
             )
             self.tree.insert("", "end", iid=str(index), values=values, tags=(tag,))
+        self._sync_select_all()
 
     def _on_tree_click(self, event) -> str | None:
         """点击最左“选”列切换勾选状态。"""
@@ -552,6 +664,279 @@ class PrintCaseApp:
         else:
             self.checked = set(range(len(self.cases)))
         self._render_cases()
+
+    def _toggle_all_from_checkbox(self) -> None:
+        """表头“全选”复选框：按复选框当前状态设置全部用例。"""
+        if self.select_all_var.get():
+            self.checked = set(range(len(self.cases)))
+        else:
+            self.checked.clear()
+        self._render_cases()
+
+    def _sync_select_all(self) -> None:
+        """同步“全选”复选框与已选计数（部分勾选时复选框为未选中）。"""
+        total = len(self.cases)
+        selected = len(self.checked)
+        try:
+            self.select_all_var.set(bool(total) and selected == total)
+            self.case_count_label.configure(text=f"{total} 条 · 已选 {selected} 条")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- 长文本可读性：悬浮提示 / 详情窗口 / 自适应列宽 ----------
+    def _install_fulltext_helpers(self) -> None:
+        """为表格单元格和可能被截断的标签挂上完整文本查看能力。"""
+        self.tip = HoverTip(self.root)
+        self._cell_font = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self._bind_tree_overview(self.tree)
+        self._bind_tree_overview(self.history_tree)
+        for widget, getter in (
+            (self.file_label, lambda: self.file_label.cget("text")),
+            (self.driver_label, lambda: self.driver_label.cget("text")),
+            (self.converter_label, lambda: self.converter_label.cget("text")),
+            (self.engine_label, lambda: self.engine_label.cget("text")),
+            (self.env_label, lambda: self.env_label.cget("text")),
+            (self.case_count_label, lambda: self.case_count_label.cget("text")),
+        ):
+            self._bind_widget_tip(widget, getter)
+
+    def _bind_widget_tip(self, widget: tk.Misc, getter) -> None:
+        """标签被窗口挤压时，悬停显示完整文本。"""
+
+        def enter(event) -> None:
+            text = str(getter() or "")
+            try:
+                font = tkfont.Font(font=widget.cget("font"))
+                needed = font.measure(text) + 16
+                width = widget.winfo_width()
+            except Exception:  # noqa: BLE001
+                needed, width = 0, 0
+            if width > 1 and needed > width:
+                self.tip.schedule(text, event.x_root, event.y_root)
+
+        widget.bind("<Enter>", enter, add="+")
+        widget.bind("<Leave>", lambda _event: self.tip.hide(), add="+")
+
+    def _bind_tree_overview(self, tree: ttk.Treeview) -> None:
+        tree.bind("<Motion>", lambda event: self._tree_motion(tree, event), add="+")
+        tree.bind("<Leave>", lambda _event: self.tip.hide(), add="+")
+        tree.bind("<MouseWheel>", lambda _event: self.tip.hide(), add="+")
+        tree.bind("<ButtonPress>", lambda _event: self.tip.hide(), add="+")
+
+    def _tree_motion(self, tree: ttk.Treeview, event) -> None:
+        """悬停在被列宽截断的单元格上时，浮层显示完整内容。"""
+        try:
+            if tree.identify("region", event.x, event.y) != "cell":
+                self.tip.hide()
+                return
+            row = tree.identify_row(event.y)
+            column = tree.identify_column(event.x)
+            if not row or not column:
+                self.tip.hide()
+                return
+            index = int(column.lstrip("#")) - 1
+            keys = list(tree["columns"])
+            if not 0 <= index < len(keys):
+                self.tip.hide()
+                return
+            key = keys[index]
+            text = str(tree.set(row, key) or "")
+            if not text:
+                self.tip.hide()
+                return
+            width = int(tree.column(key, "width"))
+            if width and self._cell_font.measure(text) + 16 <= width:
+                self.tip.hide()
+                return
+            self.tip.schedule(text, event.x_root, event.y_root)
+        except Exception:  # noqa: BLE001
+            self.tip.hide()
+
+    def _autosize_console_columns(self) -> None:
+        self._autosize_tree(self.tree, [(key, text) for key, text, _width, _anchor in self.TREE_COLUMNS])
+        self.status_var.set("已按当前内容自适应列宽；仍显示不全时把鼠标悬停在单元格上可看完整文本")
+
+    def _autosize_history_columns(self) -> None:
+        self._autosize_tree(
+            self.history_tree,
+            [(key, self.history_headings.get(key, key)) for key in self.history_columns],
+        )
+
+    def _autosize_tree(self, tree: ttk.Treeview, columns: list[tuple[str, str]]) -> None:
+        """按表头与当前单元格内容计算列宽（上限 480px，避免一列吃掉整屏）。"""
+        for key, heading in columns:
+            if key == "check":
+                continue
+            best = self._cell_font.measure(str(heading)) + 32
+            for item in tree.get_children():
+                value = str(tree.set(item, key) or "")
+                longest = max((self._cell_font.measure(line) for line in value.splitlines()), default=0)
+                best = max(best, longest + 20)
+            try:
+                tree.column(key, width=max(44, min(best, 480)))
+            except Exception:  # noqa: BLE001
+                continue
+
+    # ---------- 行详情 / 右键复制 ----------
+    def _on_tree_double_click(self, event) -> str | None:
+        if self.tree.identify_column(event.x) == "#1":
+            return None  # 勾选列由单击处理
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        self._show_case_detail(int(row))
+        return "break"
+
+    def _show_case_detail(self, index: int) -> None:
+        if not 0 <= index < len(self.cases):
+            return
+        case = self.cases[index]
+        body = self._case_detail_text(case, self.case_results.get(case.case_id))
+        self._show_text_dialog(f"用例详情 · {case.case_id}", body)
+
+    def _case_detail_text(self, case: PrintCase, result: CaseResult | None) -> str:
+        labels = self._CASE_LABELS
+        status = "未启用" if not case.enabled else CaseStatus.PENDING.value
+        elapsed, job, message = "—", "—", case.notes or "—"
+        if result is not None:
+            status = result.status.value
+            elapsed = f"{result.elapsed_seconds:.1f} 秒" if result.elapsed_seconds is not None else "—"
+            job = f"#{result.job_id}" if result.job_id else "—"
+            message = result.message or case.notes or "—"
+        fields = [
+            ("用例编号", case.case_id),
+            ("打印文件", case.file_path or "（空）"),
+            ("解析路径", str(case.resolved_path or "—")),
+            ("是否启用", "是" if case.enabled else "否"),
+            ("页码", case.pages or "全部"),
+            ("份数", case.copies),
+            ("纸张尺寸", case.paper or "自动"),
+            ("混合尺寸", "是" if case.mixed_sizes == "yes" else "否"),
+            ("方向", labels["orientation"].get(case.orientation, case.orientation)),
+            ("颜色", labels["color"].get(case.color, case.color)),
+            ("单双面", labels["duplex"].get(case.duplex, case.duplex)),
+            ("纸盒", case.bin or "自动选择"),
+            ("打印顺序", labels["collate"].get(case.collate, case.collate or "驱动默认")),
+            ("打印质量", case.print_quality or "默认"),
+            ("纸张类型", case.media_type or "驱动默认"),
+            ("跳过空白页", "是" if case.skip_blank == "yes" else "否"),
+            ("无边距", "是" if case.borderless == "yes" else "否"),
+            ("分隔页", labels["separator"].get(case.separator_page, case.separator_page)),
+            ("分隔页来源", case.separator_bin or "—"),
+            ("装订位置", labels["binding_loc"].get(case.binding_location, case.binding_location)),
+            ("装订方式", labels["binding_method"].get(case.binding_method, case.binding_method)),
+            ("扩展属性", "；".join(f"{attr.label}={attr.value}" for attr in case.extended_attrs) or "—"),
+            ("超时设置", f"{case.timeout_seconds} 秒"),
+            ("指定打印机", case.printer or "（用默认打印机）"),
+        ]
+        lines = [f"用例 {case.case_id}", "=" * 48]
+        lines += [f"{name}：{value}" for name, value in fields]
+        lines += [
+            "",
+            "执行结果",
+            "=" * 48,
+            f"执行状态：{status}",
+            f"作业号：{job}",
+            f"耗时：{elapsed}",
+            "结果 / 诊断：",
+            str(message),
+        ]
+        return "\n".join(str(line) for line in lines)
+
+    def _on_tree_context_menu(self, event) -> str | None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        index = int(row)
+        if not 0 <= index < len(self.cases):
+            return None
+        case = self.cases[index]
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="查看完整详情", command=lambda: self._show_case_detail(index))
+        menu.add_command(label="复制本行全部信息", command=lambda: self._copy_text(self._case_row_text(index)))
+        menu.add_command(
+            label="复制诊断信息",
+            command=lambda: self._copy_text(
+                str((self.case_results.get(case.case_id).message if self.case_results.get(case.case_id) else case.notes) or "")
+            ),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _case_row_text(self, index: int) -> str:
+        values = self.tree.item(str(index), "values")
+        headings = [text for _key, text, _width, _anchor in self.TREE_COLUMNS]
+        return "\n".join(f"{heading}：{value}" for heading, value in zip(headings, values))
+
+    def _on_history_double_click(self, event) -> str | None:
+        row = self.history_tree.identify_row(event.y)
+        if not row:
+            return None
+        values = self.history_tree.item(row, "values")
+        body = "\n".join(
+            f"{self.history_headings.get(key, key)}：{value}"
+            for key, value in zip(self.history_columns, values)
+        )
+        self._show_text_dialog("历史记录详情", body)
+        return "break"
+
+    def _on_history_context_menu(self, event) -> str | None:
+        row = self.history_tree.identify_row(event.y)
+        if not row:
+            return None
+        values = self.history_tree.item(row, "values")
+        body = "\n".join(
+            f"{self.history_headings.get(key, key)}：{value}"
+            for key, value in zip(self.history_columns, values)
+        )
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="查看完整详情", command=lambda: self._show_text_dialog("历史记录详情", body))
+        menu.add_command(label="复制本行全部信息", command=lambda: self._copy_text(body))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _copy_text(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text or "")
+        self.status_var.set("已复制到剪贴板")
+
+    def _show_text_dialog(self, title: str, body: str) -> None:
+        """可滚动、可复制的详情窗口：完整显示不会换行截断的长文本。"""
+        self.tip.hide()
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG)
+        win.geometry("860x620")
+        win.minsize(560, 420)
+        win.transient(self.root)
+
+        header = tk.Frame(win, bg=PANEL)
+        header.pack(fill="x")
+        tk.Label(header, text=title, bg=PANEL, fg=INK, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left", padx=14, pady=10)
+        ttk.Button(header, text="关闭", command=win.destroy).pack(side="right", padx=(0, 12), pady=8)
+        ttk.Button(header, text="复制全部", command=lambda: self._copy_text(body)).pack(side="right", padx=(0, 8), pady=8)
+
+        area = tk.Frame(win, bg=PANEL)
+        area.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        text = tk.Text(
+            area, wrap="word", bg=PANEL, fg=INK, relief="flat", font=("Microsoft YaHei UI", 10),
+            padx=16, pady=12, spacing1=2, spacing3=6,
+        )
+        scroll = ttk.Scrollbar(area, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.insert("1.0", body)
+        text.configure(state="disabled")
+        win.bind("<Escape>", lambda _event: win.destroy())
+        win.focus_set()
+
 
     def _preflight(self) -> None:
         if not self.cases:
@@ -685,6 +1070,7 @@ class PrintCaseApp:
         self.running = True
         self._set_running_ui(True)
         self.status_var.set(f"执行中 · RUN {self.run_id}")
+        self._open_run_log()
         self._log(f"===== 开始执行 RUN {self.run_id}，共 {len(ready_cases)} 条用例 =====")
 
         def worker() -> None:
@@ -701,7 +1087,10 @@ class PrintCaseApp:
         if self.runner and self.running:
             self.runner.stop()
             self.status_var.set("正在停止：当前作业可能已经进入打印队列")
-            self._log("收到停止请求：将停止后续用例，不会假定当前打印作业已撤回。")
+            self._log("收到停止请求：将停止后续用例，不会假定当前打印作业已撤回；"
+                      "当前用例结束后会自动清理驱动属性页残留，便于马上再下发下一批。")
+            if self.run_log is not None:
+                self._log(f"完整过程见日志文件：{self.run_log.path}")
             self.btn_stop.configure(state="disabled")
 
     def _set_running_ui(self, running: bool) -> None:
@@ -731,12 +1120,14 @@ class PrintCaseApp:
                     self._set_running_ui(False)
                     self.status_var.set(f"执行完成 · RUN {payload}")
                     self._log(f"===== 执行结束 RUN {payload} =====")
+                    self._close_run_log()
                     self._update_kpis()
                 elif kind == "fatal":
                     self.running = False
                     self._set_running_ui(False)
                     self.status_var.set("执行异常")
                     self._log("执行线程异常：" + str(payload))
+                    self._close_run_log()
                     messagebox.showerror("执行异常", str(payload))
         except queue.Empty:
             pass
@@ -795,12 +1186,48 @@ class PrintCaseApp:
         self.log_text.insert("end", text + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        if self.run_log is not None:
+            try:
+                self.run_log.write(text)
+            except Exception:  # noqa: BLE001 - 写日志失败不能影响下发
+                pass
+
+    def _open_run_log(self) -> None:
+        """每次运行单独落盘，失败可以事后翻完整过程。"""
+        self._close_run_log()
+        try:
+            self.run_log = RunLog(data_dir() / "logs", self.run_id)
+        except Exception as exc:  # noqa: BLE001
+            self.run_log = None
+            self._log(f"无法创建执行日志文件（不影响下发）：{exc}")
+            return
+        self._log(f"本次执行日志文件：{self.run_log.path}")
+
+    def _close_run_log(self) -> None:
+        if self.run_log is None:
+            return
+        path = self.run_log.path
+        try:
+            self.run_log.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.run_log = None
+        self.log_path = path
+
+    def _open_log_dir(self) -> None:
+        directory = data_dir() / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(directory))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showinfo("日志目录", f"{directory}\n\n（无法自动打开：{exc}）")
 
     def _on_close(self) -> None:
         if self.running:
             if not messagebox.askyesno("确认退出", "打印任务正在执行。退出将停止后续下发，但无法保证已提交到打印机的作业被撤回。仍要退出？"):
                 return
             self._stop_run()
+        self._close_run_log()
         self.root.destroy()
 
 
