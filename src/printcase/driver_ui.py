@@ -632,12 +632,39 @@ def _combos_ready(window, need: int, timeout: float = 5.0) -> list:
     return combos
 
 
-def _select_combo_index(combo, index: int) -> None:
-    """按序号选中下拉项。
+def _combo_items_wrappers(combo) -> list:
+    """展开下拉并返回条目控件（自绘下拉收起时读不到，展开后才有 ListItem）。"""
+    for _ in range(3):
+        wrappers = [
+            item for item in _descendants(combo, control_type="ListItem")
+            if _text_of(item).strip()
+        ]
+        if wrappers:
+            return wrappers
+        try:
+            combo.click_input()
+        except Exception:  # noqa: BLE001
+            return []
+        time.sleep(0.35)
+    return [
+        item for item in _descendants(combo, control_type="ListItem")
+        if _text_of(item).strip()
+    ]
 
-    这类驱动的下拉项是自绘的，UIA 读不到条目文本，但键盘定位稳定有效：
-    聚焦 → Home 回第一项 → 下移 index 次 → 回车。
+
+def _select_combo_index(combo, index: int) -> None:
+    """按序号选中下拉项：优先展开后直接点第 index 个条目。
+
+    旧实现用“Home + 下移 index 次 + 回车”，在这台驱动上会偏一格
+    （实测选“纸盒1”落到“纸盒2”，选第 3 项落到第 4 项）；条目能读到时
+    直接点条目最稳，读不到时才退回键盘定位。
     """
+    wrappers = _combo_items_wrappers(combo)
+    if wrappers:
+        target = wrappers[min(int(index), len(wrappers) - 1)]
+        target.click_input()
+        time.sleep(0.3)
+        return
     combo.click_input()
     time.sleep(0.25)
     combo.type_keys("{HOME}")
@@ -650,11 +677,25 @@ def _select_combo_index(combo, index: int) -> None:
     time.sleep(0.25)
 
 
-def _combo_options(combo) -> list[str]:
-    try:
-        return [str(item) for item in (getattr(combo, "texts", lambda: [])() or [])]
-    except Exception:  # noqa: BLE001
-        return []
+def _select_combo_text(combo_ref, wanted: str) -> bool:
+    """按条目文本选中下拉项（展开 → 点同名条目）。"""
+    wrappers = _combo_items_wrappers(combo_ref)
+    if not wrappers:
+        return False
+    options = [_text_of(item).strip() for item in wrappers]
+    match = _best_match(options, wanted)
+    if match is None:
+        try:
+            combo_ref.type_keys("{ESC}")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    for wrapper in wrappers:
+        if _text_of(wrapper).strip() == match:
+            wrapper.click_input()
+            time.sleep(0.3)
+            return True
+    return False
 
 
 def _combo_current_index(combo) -> int | None:
@@ -690,15 +731,6 @@ def _combo_already_selected(combo, action: "Action") -> bool:
     return False
 
 
-def _select_combo_text(combo, wanted: str) -> bool:
-    options = _combo_options(combo)
-    match = _best_match(options, wanted)
-    if match is None:
-        return False
-    combo.select(match)
-    return True
-
-
 def _apply_action(window, action: Action, log=None) -> None:
     if action.kind in {"combo_index", "combo_text"}:
         position = PAPER_TAB_COMBOS.index(action.label) if action.label in PAPER_TAB_COMBOS else -1
@@ -723,7 +755,16 @@ def _apply_action(window, action: Action, log=None) -> None:
                 log(f"驱动属性页：{action.label} 已是目标项（{action.target_text or action.value}），无需变更")
             return False
         if action.kind == "combo_index":
-            _select_combo_index(combo, int(action.value))
+            # 优先按名称点条目：这类自绘下拉用“Home+下移 N 次”会偏一格
+            # （实测选“纸盒1”落到“纸盒2”），点条目才准；读不到条目再退回序号。
+            picked = bool(action.target_text) and _select_combo_text(combo, action.target_text)
+            if not picked:
+                _select_combo_index(combo, int(action.value))
+            actual = _combo_current_text(combo).strip()
+            if action.target_text and actual and _norm(actual) != _norm(action.target_text):
+                raise DriverUiError(
+                    f"“{action.label}”设置后回读不一致：期望“{action.target_text}”，实际“{actual}”。"
+                )
         else:
             # 驱动能读到条目时按名称选；读不到（自绘下拉）时给出明确原因
             if not _select_combo_text(combo, str(action.value)):
@@ -935,7 +976,7 @@ def apply_case(
     """按用例在驱动属性页设置属性，回读确认后返回还原函数。"""
     actions = plan_actions(case, caps)
     before = snapshot(printer, w=w)
-    if not actions:
+    if not actions and not case.extended_attrs:
         if log:
             log("用例未填写需要驱动界面设置的属性，保留驱动当前默认设置。")
         return lambda: None

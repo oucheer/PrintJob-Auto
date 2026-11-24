@@ -929,19 +929,216 @@ def _set_bool_control(container, label: str, desired: bool, log: Callable[[str],
     return False
 
 
+def _visible_control(control) -> bool:
+    try:
+        return bool(control.is_visible())
+    except Exception:  # noqa: WPS420
+        return True
+
+
+def _combo_enabled(combo) -> bool:
+    try:
+        return bool(combo.is_enabled())
+    except Exception:  # noqa: WPS420
+        return True
+
+
+def _combo_current_text(combo) -> str:
+    """读下拉当前选中文本；自绘/不可读时返回空串。"""
+    try:
+        return str(combo.selected_text() or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _combo_item_wrappers(combo) -> list:
+    """展开下拉并返回条目控件（读完保持展开，调用方决定点选还是收起）。
+
+    这类驱动的下拉是自绘的：收起时 ``texts()`` 直接抛 COMError，
+    条目只有展开后才以 ListItem 形式出现在可访问性树里。
+    """
+    for _ in range(3):
+        wrappers = [
+            item for item in _descendants(combo, control_type="ListItem")
+            if _text_of(item).strip()
+        ]
+        if wrappers:
+            return wrappers
+        try:
+            combo.click_input()
+        except Exception:  # noqa: WPS420
+            return []
+        time.sleep(0.35)
+    return [
+        item for item in _descendants(combo, control_type="ListItem")
+        if _text_of(item).strip()
+    ]
+
+
+def _combo_items(combo) -> list[str]:
+    """读取下拉条目文本。
+
+    注意：这类驱动收起状态下 ``texts()`` 返回的是子控件的文字
+    （标签 + 当前值 + “关闭”按钮），并不是选项列表；所以必须先展开读
+    ListItem，展开也读不到时才退回 ``texts()``。
+    """
+    wrappers = _combo_item_wrappers(combo)
+    if wrappers:
+        items = [_text_of(item).strip() for item in wrappers]
+        try:
+            combo.type_keys("{ESC}")     # 收起列表，避免挡住后面的控件
+        except Exception:  # noqa: WPS420
+            pass
+        time.sleep(0.15)
+        return [item for item in items if item]
+    try:
+        items = [str(item).strip() for item in (combo.texts() or [])]
+    except Exception:  # noqa: BLE001 - 自绘下拉收起时必抛 COMError
+        return []
+    return [item for item in items if item]
+
+
+def _select_combo_item(combo, wanted: str) -> bool:
+    """按条目文本选中下拉项：展开 → 点同名 ListItem → 结束。
+
+    「Home + 下移 N 次」这种键盘定位在这类驱动上会偏一格（实测选“纸盒1”落到
+    “纸盒2”），因此优先直接点条目。
+    """
+    wrappers = _combo_item_wrappers(combo)
+    if not wrappers:
+        return False
+    options = [_text_of(item).strip() for item in wrappers]
+    match = _best_match(options, wanted)
+    if match is None:
+        try:
+            combo.type_keys("{ESC}")
+        except Exception:  # noqa: WPS420
+            pass
+        return False
+    for wrapper in wrappers:
+        if _text_of(wrapper).strip() == match:
+            wrapper.click_input()
+            time.sleep(0.3)
+            return True
+    return False
+
+
+def _find_combo(container, label_text: str):
+    """按标签找下拉框：先精确同名，再退化为包含匹配。
+
+    精确优先很重要：纸张页上“分隔页”和“分隔页（OHP插页）纸张来源”同时存在，
+    包含匹配会把前者错配到后者。
+    """
+    combos = [combo for combo in _descendants(container, control_type="ComboBox") if _visible_control(combo)]
+    target = _norm(label_text)
+    for combo in combos:
+        if _norm(_label_before(combo)) == target or _norm(_text_of(combo)) == target:
+            return combo
+    for combo in combos:
+        if _matches_labels(_label_before(combo), (label_text,)) or _matches_labels(_text_of(combo), (label_text,)):
+            return combo
+    return None
+
+
+def _select_radio(container, words, log: Callable[[str], None] | None = None, description: str = "") -> bool:
+    """按文字点单选按钮（驱动把“输出”做成 正常/分隔页/OHP插页 三个单选项）。"""
+    labels = words if isinstance(words, (tuple, list)) else (words,)
+    for radio in _descendants(container, control_type="RadioButton"):
+        text = _text_of(radio)
+        if not text.strip():
+            continue
+        if _matches_labels(text, labels):
+            radio.click_input()
+            time.sleep(0.25)
+            if log:
+                log(f"{description or '驱动属性'}：选择“{text.strip()}”")
+            return True
+    return False
+
+
+# 纸张页“输出”分组里的分隔页下拉；它必须先把“纸张来源”指到具体纸盒才可用
+SEPARATOR_LABELS = ("分隔页", "分隔页（OHP插页）纸张来源")
+SEPARATOR_SOURCE_LABELS = ("来源", "纸张来源")
+
+
+def _separator_prerequisite(container, label_text: str) -> str:
+    """返回分隔页下拉不可用的原因（可用时返回空串），供报错提示复用。"""
+    combo = _find_combo(container, label_text)
+    if combo is None:
+        return f"驱动属性页里找不到“{label_text}”下拉框"
+    if _combo_enabled(combo):
+        return ""
+    source_combo = _find_combo(container, "来源")
+    current = ""
+    if source_combo is not None:
+        current = _combo_current_text(source_combo)
+    if current and "自动" in current:
+        return (
+            f"驱动把“{label_text}”灰化了：纸张来源是“{current}”时不能插分隔页。"
+            "请把用例“纸盒”列改成具体纸盒（纸盒1/纸盒2），或在驱动扩展属性里加一行“纸张来源=纸盒1”。"
+        )
+    return (
+        f"驱动把“{label_text}”灰化了（需在“输出”分组里先选中“分隔页”，"
+        "并且纸张来源必须是具体纸盒）。"
+    )
+
+
+def _ensure_separator_enabled(container, label_text: str, log: Callable[[str], None]) -> None:
+    """把“输出→分隔页”切过去，让分隔页下拉解禁；做不到就抛出可操作的错误。"""
+    combo = _find_combo(container, label_text)
+    if combo is not None and _combo_enabled(combo):
+        return
+    reason = _separator_prerequisite(container, label_text)
+    if "自动" in reason:
+        raise UiPrintError(reason)
+    mode = "OHP插页" if "OHP" in label_text else "分隔页"
+    if _select_radio(container, (mode,), log, "驱动属性"):
+        time.sleep(0.4)
+        combo = _find_combo(container, label_text)
+        if combo is not None and _combo_enabled(combo):
+            return
+    raise UiPrintError(_separator_prerequisite(container, label_text) or reason)
+
+
 def _set_choice_control(container, label: str, value: str, log: Callable[[str], None], description: str = "") -> bool:
     label_text = base_label(label)
-    for combo in _descendants(container, control_type="ComboBox"):
-        if not _matches_labels(_label_before(combo), (label_text,)) and not _matches_labels(_text_of(combo), (label_text,)):
-            continue
-        options = [str(item) for item in (getattr(combo, "texts", lambda: [])() or [])]
-        match = _best_match(options, value)
-        if match is None:
-            raise UiPrintError(f"{label_text}：驱动下拉里找不到“{value}”（可选：{'、'.join(options[:6]) or '无'}）")
+    if any(_norm(label_text) == _norm(name) for name in SEPARATOR_LABELS):
+        _ensure_separator_enabled(container, label_text, log)
+    combo = _find_combo(container, label_text)
+    if combo is None:
+        return False
+    options = _combo_items(combo)
+    exact = next((item for item in options if _norm(item) == _norm(value)), None)
+    match = exact or (_best_match(options, value) if options else None)
+    if match is not None and exact is None and _norm(match) in _norm(value):
+        # 用户写的是“作业之间和份数之间”，驱动只有“作业之间”：不能悄悄降级成一半
+        raise UiPrintError(
+            f"{label_text}：驱动下拉里没有“{value}”这一项"
+            f"（可选：{'、'.join(options)}）"
+        )
+    if match is None:
+        raise UiPrintError(
+            f"{label_text}：驱动下拉里找不到“{value}”"
+            f"（可选：{'、'.join(options) if options else '驱动未暴露条目'}）"
+        )
+    if not _combo_enabled(combo):
+        raise UiPrintError(_separator_prerequisite(container, label_text) or f"{label_text}：控件当前灰化，无法选择。")
+    selected = False
+    try:
         combo.select(match)
-        log(f"{description or '驱动属性'}：{label_text} = {match}")
-        return True
-    return False
+        time.sleep(0.3)
+        current = _combo_current_text(combo)
+        # 读不到当前文本（自绘下拉）时按“已选中”处理，靠上层 DEVMODE 回读兜底
+        selected = (not current) or _norm(current) == _norm(match)
+    except Exception:  # noqa: BLE001 - 自绘下拉的 select 可能直接报错
+        selected = False
+    if not selected:
+        selected = _select_combo_item(combo, match)
+    if not selected:
+        actual = _combo_current_text(combo) or "读取不到"
+        raise UiPrintError(f"{label_text}：选择“{match}”后回读不一致（当前 {actual}）。")
+    log(f"{description or '驱动属性'}：{label_text} = {match}")
+    return True
 
 
 def _set_text_control(container, label: str, value: str, log: Callable[[str], None], description: str = "") -> bool:
@@ -985,7 +1182,18 @@ def apply_driver_attrs(driver_window, attrs: list[ExtendedAttr], log: Callable[[
                     if not _set_bool_control(driver_window, attr.label, desired, log):
                         unresolved.append(f"{attr.label}={attr.value}（未找到勾选框）")
                 elif kind == "choice":
-                    if not _set_choice_control(driver_window, attr.label, attr.value, log):
+                    if _norm(base_label(attr.label)) == _norm("输出模式"):
+                        # 纸张页“输出”分组：正常/分隔页/OHP插页，是单选按钮不是下拉
+                        if not _select_radio(driver_window, (attr.value,), log, "驱动属性"):
+                            unresolved.append(f"输出模式={attr.value}（未找到该单选项）")
+                    elif (any(_norm(base_label(attr.label)) == _norm(name) for name in SEPARATOR_LABELS)
+                          and _norm(attr.value) in {_norm("无"), _norm("关闭"), _norm("正常")}):
+                        # 驱动没有“无”这一项：等于把“输出”切回“正常”
+                        if _select_radio(driver_window, ("正常",), log, "驱动属性"):
+                            log("驱动属性：分隔页 = 无（“输出”切回“正常”）")
+                        else:
+                            unresolved.append(f"{attr.label}={attr.value}（未找到“输出→正常”单选项）")
+                    elif not _set_choice_control(driver_window, attr.label, attr.value, log):
                         unresolved.append(f"{attr.label}={attr.value}（未找到下拉框）")
                 elif kind == "pair":
                     pair = split_pair(attr.value)
@@ -1010,6 +1218,8 @@ def apply_driver_attrs(driver_window, attrs: list[ExtendedAttr], log: Callable[[
                             unresolved.append(f"{attr.label}={attr.value}（未找到输入框）")
             except UiPrintError as exc:
                 unresolved.append(f"{attr.label}：{exc}")
+            except Exception as exc:  # noqa: BLE001 - 自绘控件随时可能抛 COMError
+                unresolved.append(f"{attr.label}={attr.value}（{type(exc).__name__}: {exc}）")
     return unresolved
 
 

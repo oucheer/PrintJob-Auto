@@ -272,6 +272,10 @@ class PrintRunner:
             each_copy_mode = case.separator_page == "each_copy" and case.copies > 1
             if not each_copy_mode and case.separator_page in {"before", "both"}:
                 self._print_separator_page(case, printer, on_event, position="before", temp_dir=temp_dir, caps=caps, emit=emit)
+            if case.separator_page == "each_copy" and case.copies <= 1:
+                # 份数只有 1 时“份与份之间”没有落点，静默跳过会让人以为属性没生效
+                emit("提示：分隔页=份数之间，但份数为 1，份与份之间不会产生分隔页；"
+                     "如需分隔页请把份数改为 2 以上，或把分隔页改成“前/后”。")
 
             # 步骤 2-3/4：打开文档 → 选择驱动 → 按用例属性下发（在 submit 内逐步汇报）
             job_case = replace(case, copies=1) if each_copy_mode else case
