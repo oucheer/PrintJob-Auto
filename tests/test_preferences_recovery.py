@@ -164,3 +164,64 @@ def test_close_preference_window_kills_hung_host(monkeypatch):
 
     assert du._close_preference_window(window) is True
     assert killed == [7777]
+
+
+class HandleDesktop(FakeDesktop):
+    """按句柄取窗口的替身：模拟“原生枚举可用、UIA 全量遍历不可用”。"""
+
+    def __init__(self, windows=()) -> None:
+        super().__init__(windows)
+        self.by_handle = {w.handle: w for w in windows}
+        self.handle_requests: list[int] = []
+
+    def window(self, handle=None, **_kwargs):
+        self.handle_requests.append(handle)
+        return self.by_handle[handle]
+
+    def windows(self):
+        raise AssertionError("不应回退到 UIA 全量遍历")
+
+
+def test_preferences_window_found_by_native_enumeration(monkeypatch):
+    """窗口发现优先走原生 EnumWindows，不再依赖 UIA 全量遍历。"""
+    window = FakeWindow("Fake Printer 打印首选项", handle=131072)
+    desktop = HandleDesktop([window])
+    monkeypatch.setattr(du, "_native_preference_handles", lambda _p: [131072])
+
+    assert du._preferences_windows(desktop, "Fake Printer") == [window]
+    assert desktop.handle_requests == [131072]
+
+
+def test_open_preferences_survives_uia_enumeration_failure(monkeypatch):
+    """UIA 全量枚举整体失效时，靠原生枚举仍要能打开（用户现场的症状）。"""
+    window = FakeWindow("Fake Printer 打印首选项", handle=131072)
+    desktop = HandleDesktop([window])
+    monkeypatch.setattr(du, "_native_preference_handles", lambda _p: [131072])
+    # 假句柄上没有真实消息循环，这里只验证“窗口被发现并返回”
+    monkeypatch.setattr(du, "_responsive", lambda *_a, **_k: True)
+
+    result = du.open_preferences("Fake Printer", timeout=3, desktop=desktop, attempts=1)
+    assert result is window
+    assert desktop.handle_requests == [131072]
+
+
+def test_uia_blind_window_reports_accurate_reason(monkeypatch):
+    """窗口确实起来了但 UIA 读不到：原因要说清，并提示重启程序。"""
+
+    class BlindDesktop(FakeDesktop):
+        def windows(self):
+            raise RuntimeError("UIA 全量枚举失败")
+
+        def window(self, handle=None, **_kwargs):
+            raise RuntimeError("UIA 单句柄查询也失败")
+
+    monkeypatch.setattr(du, "_native_preference_handles", lambda _p: [131072])
+    with pytest.raises(du.DriverUiError) as excinfo:
+        du.open_preferences(
+            "Fake Printer", timeout=2, attempts=1, desktop=BlindDesktop(),
+            launcher=lambda _p: FakeProc(exited=False),
+        )
+
+    text = str(excinfo.value)
+    assert "无法通过 UI 自动化读取" in text
+    assert "重启程序" in text

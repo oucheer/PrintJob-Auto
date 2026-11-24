@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import PrintCase
-from .ui_print import _best_match, _descendants, _matches_labels, _norm, _text_of
+from .ui_print import _best_match, _descendants, _matches_labels, _norm
+from .ui_print import _text_of as _uia_text_of
 from .validator import normalize_paper
 
 # 常用纸张的 DMPAPER_* 代号（驱动未上报 DC_PAPERS 时使用）
@@ -185,9 +186,10 @@ def _desktop():
 # 一个窗口都不建；旧实现只会傻等到超时再把用例判失败。现在盯住进程，
 # 秒退就立即清理重试。
 PRINTUI_EXIT_GRACE = 1.2     # 进程退出后再给窗口 1.2 秒出现的机会
-PREFERENCE_OPEN_ATTEMPTS = 3
-PREFERENCE_RETRY_PAUSE = 0.8
+PREFERENCE_OPEN_ATTEMPTS = 4
+PREFERENCE_RETRY_PAUSE = 1.2  # 第 n 次重试前等待 n×该值（1.2s、2.4s、3.6s）
 PREFERENCE_MIN_BUDGET = 4.0  # 单次尝试最少等多久（慢驱动冷启动）
+PREFERENCE_OPEN_TIMEOUT = 40.0  # 打开属性页的总预算（含全部重试）
 
 _PREFERENCE_WORDS = ("首选项", "属性", "Preferences", "Properties")
 _PRINTUI_EXE_NAMES = {"rundll32.exe", "printui.exe"}
@@ -257,8 +259,74 @@ def _desktop_windows(desktop) -> list:
         return []
 
 
+def _hwnd_of(window) -> int:
+    """窗口句柄；pywinauto 包装对象可用，失效时返回 0。"""
+    try:
+        return int(getattr(window, "handle", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _native_window_title(hwnd: int) -> str:
+    try:
+        import win32gui  # noqa: WPS433
+
+        return str(win32gui.GetWindowText(hwnd) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _text_of(window) -> str:
+    """窗口/控件文本；UIA 读不到时回退到原生 GetWindowText。
+
+    UIA 的全量枚举与元素读取在长时间运行、系统繁忙或驱动窗口刚创建时会整体
+    失效（返回空或抛异常）。此时属性页其实已经打开，旧实现却完全“看不见”它，
+    只能白等预算后判失败。原生 API 只依赖句柄，几乎不会失败。
+    """
+    text = _uia_text_of(window)
+    if text:
+        return text
+    hwnd = _hwnd_of(window)
+    return _native_window_title(hwnd) if hwnd else ""
+
+
+def _native_preference_handles(printer: str) -> list[int]:
+    """用 EnumWindows 找出该打印机“首选项/属性”窗口的句柄（含不可见窗口）。
+
+    比 UIA 全量遍历快两个数量级（0 ms vs 数百毫秒），且不会漏掉刚创建的窗口。
+    """
+    try:
+        import win32gui  # noqa: WPS433
+    except ImportError:
+        return []
+    wanted = _norm(printer)
+    handles: list[int] = []
+
+    def callback(hwnd, _param):
+        title = str(win32gui.GetWindowText(hwnd) or "")
+        if title and any(word in title for word in _PREFERENCE_WORDS):
+            if not wanted or wanted in _norm(title):
+                handles.append(int(hwnd))
+        return True
+
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:  # noqa: BLE001
+        return []
+    return handles
+
+
 def _preferences_windows(desktop, printer: str) -> list:
-    """所有属于该打印机的属性页窗口（含不可见窗口，标题里带“首选项/属性”）。"""
+    """该打印机的属性页窗口：原生枚举优先（快、不漏），UIA 全量遍历兜底。"""
+    windows = []
+    for hwnd in _native_preference_handles(printer):
+        try:
+            windows.append(desktop.window(handle=hwnd))
+        except Exception:  # noqa: BLE001 - UIA 暂时不可用时跳过，由调用方判断
+            continue
+    if windows:
+        return windows
+
     wanted = _norm(printer)
     matches = []
     for window in _desktop_windows(desktop):
@@ -273,8 +341,18 @@ def _preferences_windows(desktop, printer: str) -> list:
 
 
 def _window_pid(window) -> int | None:
+    """窗口所属进程 ID；UIA 不可用时退回 GetWindowThreadProcessId。"""
     try:
         return int(window.element_info.process_id)
+    except Exception:  # noqa: BLE001
+        pass
+    hwnd = _hwnd_of(window)
+    if not hwnd:
+        return None
+    try:
+        import win32process  # noqa: WPS433
+
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
     except Exception:  # noqa: BLE001
         return None
 
@@ -332,9 +410,18 @@ def _terminate_pid(pid: int) -> bool:
 
 
 def _window_gone(window, timeout: float = 1.5) -> bool:
-    """等待窗口消失；句柄失效/读不到标题都按“已消失”处理。"""
+    """等待窗口消失；句柄已失效/读不到标题都按“已消失”处理。"""
+    hwnd = _hwnd_of(window)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if hwnd:
+            try:
+                import win32gui  # noqa: WPS433
+
+                if not win32gui.IsWindow(hwnd):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
         try:
             window.is_visible()
         except Exception:  # noqa: BLE001
@@ -393,21 +480,32 @@ def _usable_preferences(desktop, printer: str, log=None):
 
 
 def _wait_preferences(desktop, printer: str, handle, timeout: float, log=None):
-    """等到属性页窗口出现；printui 秒退时立即放弃（交给外层重试）。"""
+    """等到属性页窗口出现；printui 秒退时立即放弃（交给外层重试）。
+
+    窗口是否出现用原生枚举判断（不依赖 UIA），因此“窗口已经打开但 UIA 读不到”
+    会被区分出来，而不是笼统地报成“窗口未出现”。
+    """
     started = time.monotonic()
     deadline = started + max(2.0, timeout)
     exited_at: float | None = None
+    native_seen = False
     while True:
         window = _usable_preferences(desktop, printer, log=log)
         if window is not None:
             return window, "已出现"
+        if _native_preference_handles(printer):
+            native_seen = True
         now = time.monotonic()
         if _process_alive(handle) is False:
             if exited_at is None:
                 exited_at = now
             elif now - exited_at >= PRINTUI_EXIT_GRACE:
+                if native_seen:
+                    return None, "属性页窗口已出现，但无法通过 UI 自动化读取其控件"
                 return None, "启动的 printui 进程已退出，且没有创建任何窗口"
         if now >= deadline:
+            if native_seen:
+                return None, "属性页窗口已出现，但无法通过 UI 自动化读取其控件"
             if exited_at is not None:
                 return None, "启动的 printui 进程已退出，且没有创建任何窗口"
             return None, f"{deadline - started:.0f} 秒内没有出现属性页窗口"
@@ -416,7 +514,7 @@ def _wait_preferences(desktop, printer: str, handle, timeout: float, log=None):
 
 def open_preferences(
     printer: str,
-    timeout: float = 25,
+    timeout: float = PREFERENCE_OPEN_TIMEOUT,
     desktop=None,
     log=None,
     launcher: Callable[[str], object] | None = None,
@@ -425,9 +523,8 @@ def open_preferences(
     """打开驱动“打印首选项”窗口（rundll32 printui /e，等价于手工点开首选项）。
 
     上一轮下发被停止/中断后，驱动往往还在收尾，此时 printui 可能**静默退出**、
-    一个窗口都不建。旧实现会一直等到超时才判失败，于是“停止后再勾选一批直接失败”。
-    这里改为：复用已打开的窗口 → 盯着 printui 进程，秒退立即重试 → 每次重试前
-    清掉残留窗口和进程。默认最多 3 次，单次预算按总超时均分。
+    一个窗口都不建；另外 UIA 全量枚举也可能暂时读不到已打开的窗口。
+    这里改为：复用已打开的窗口 → 改用原生枚举判断窗口出现 → 秒退立即清理重试。
     """
     desktop = desktop or _desktop()
     attempts = max(1, int(attempts))
@@ -456,14 +553,21 @@ def open_preferences(
         for leftover in _preferences_windows(desktop, printer):
             _close_preference_window(leftover, log=log)
         if attempt < attempts:
+            pause = PREFERENCE_RETRY_PAUSE * attempt
             if log:
-                log(f"驱动属性页未出现（{note}），清理残留后重试（第 {attempt + 1}/{attempts} 次）")
-            time.sleep(PREFERENCE_RETRY_PAUSE)
+                log(f"驱动属性页未出现（{note}），{pause:.1f} 秒后重试（第 {attempt + 1}/{attempts} 次）")
+            time.sleep(pause)
 
+    ui_blind = any("无法通过 UI 自动化读取" in note for note in notes)
+    advice = (
+        "属性页窗口能打开但读不到控件，通常是本程序的 UI 自动化通道异常，请重启程序后再试。"
+        if ui_blind
+        else "若刚停止过上一轮打印，请等打印机队列清空（或打印任务指示灯熄灭）后重试。"
+    )
     raise DriverUiError(
-        f"驱动“打印首选项”窗口未出现（{printer}）；已尝试 {attempts} 次。"
+        f"驱动“打印首选项”窗口未出现（{printer}）；已尝试 {attempts} 次、共约 {total:.0f} 秒。"
         + ("原因：" + "；".join(notes) + "。" if notes else "")
-        + "请确认驱动已正确安装；若刚停止过上一轮打印，请等打印机队列清空后重试。"
+        + advice
     )
 
 

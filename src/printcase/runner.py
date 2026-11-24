@@ -284,9 +284,11 @@ class PrintRunner:
             known_ids = set(baseline)
             if watcher is not None:
                 known_ids |= watcher.snapshot_ids()
+            submitted = False
             try:
                 submit_result = self._submit_case(printer, job_case, source_path, emit, temp_dir)
                 self._submitted_since_idle = True
+                submitted = True
                 backend, doc_stem = submit_result[0], submit_result[1]
                 job_hint = submit_result[2] if len(submit_result) > 2 else None
                 if job_hint:
@@ -311,6 +313,11 @@ class PrintRunner:
                 result.message = f"Office 文档转 PDF 失败：{submit_error}"
                 emit(result.message)
                 return result
+            finally:
+                # 下发阶段就失败时不会走到下面的 await，必须先停掉监视线程，
+                # 否则它每 0.08 秒 OpenPrinter 一次，跨用例累积成后台泄漏。
+                if not submitted and watcher is not None:
+                    watcher.stop()
             result.settings["backend"] = backend
             emit(f"步骤 3/4 完成：作业已通过 {backend} 通道提交，开始监视打印队列")
 
