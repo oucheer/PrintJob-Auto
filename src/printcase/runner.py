@@ -15,7 +15,7 @@ from .driver_ui import DriverUiError, apply_case, close_stale_preferences
 from .models import CaseResult, CaseStatus, PrintCase
 from .office import DocumentConversionError
 from .queue_watch import ERROR_JOB_MASKS, QueueWatcher
-from .ui_print import UI_PRINTABLE_EXTENSIONS, UiPrintError, print_with_ui
+from .ui_print import UI_PRINTABLE_EXTENSIONS, UiPrintError, UiPrintInterrupted, print_with_ui
 from .separator import create_case_separator_pdf
 from .validator import normalize_paper, validate_case
 
@@ -101,6 +101,7 @@ class PrintRunner:
                 printer, job_case, source_path, log,
                 timeout=job_case.timeout_seconds,
                 set_driver_attributes=False,
+                should_stop=self.stop_event.is_set,
             )
         log(f"{Path(source_path).suffix} 没有可自动化的文档界面，本次由内置渲染器送入打印队列")
         return self.submit(printer, job_case, source_path, log, temp_dir)
@@ -293,6 +294,14 @@ class PrintRunner:
                 job_hint = submit_result[2] if len(submit_result) > 2 else None
                 if job_hint:
                     result.job_id = job_hint
+            except UiPrintInterrupted as interrupted:
+                # 用户点了“停止”：按“已停止”记录，不记失败，也不重试；
+                # 同时锁停止标记，保证后面的用例不会再打开文档。
+                self.stop_event.set()
+                result.status = CaseStatus.STOPPED
+                result.message = str(interrupted) or "用户请求停止；本次用例未完成下发。"
+                emit(result.message)
+                return result
             except UiPrintError as submit_error:
                 result.status = CaseStatus.FAILED
                 result.message = f"UI 自动化打印失败：{submit_error}"

@@ -224,3 +224,74 @@ def test_runner_waits_for_previous_job_before_opening_driver_page(tmp_path, monk
     # 第二件作业开始前出现“队列仍有作业”的等待，之后才继续设置属性
     assert any("队列仍有" in line for line in logs)
     assert order == ["apply", "submit", "apply", "submit"]
+
+
+def test_runner_treats_interrupted_submit_as_stopped(tmp_path):
+    """下发途中用户点“停止”：用例记“已停止”，不记失败，也不再继续下发后面的用例。"""
+    from printcase.ui_print import UiPrintInterrupted
+
+    spooler = FakeSpooler()
+    called: list[str] = []
+
+    def ui_submit(printer, case, source_path, log, temp_dir):
+        called.append(case.case_id)
+        raise UiPrintInterrupted("收到停止请求，已中止本次下发（等待文档窗口阶段）")
+
+    pdf = tmp_path / "sample.docx"
+    pdf.write_bytes(b"PK")
+    cases = [
+        PrintCase(case_id=f"TC-STOP-{i}", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
+        for i in range(3)
+    ]
+    runner = PrintRunner(
+        spooler, AuditStore(tmp_path / "audit.sqlite3"), queue_timeout=1,
+        submitter=fake_submitter(), driver_applier=fake_driver_applier(),
+        ui_submitter=ui_submit,
+    )
+    results = runner.run_cases(cases, "Test Printer", "RUN007", lambda *_: None)
+
+    assert called == ["TC-STOP-0"]                      # 第一件中止后不再打开文档
+    assert results[0].status == CaseStatus.STOPPED
+    assert "停止" in results[0].message
+    assert all(item.status == CaseStatus.STOPPED for item in results)
+
+
+def test_runner_submits_full_batch_after_interrupted_batch(tmp_path):
+    """上一批被中途停止后，下一批（同一 runner 实例）必须能完整下发。"""
+    from printcase.ui_print import UiPrintInterrupted
+
+    spooler = FakeSpooler()
+    submitted: list[str] = []
+    stop_after = {"remaining": 1}
+
+    def ui_submit(printer, case, source_path, log, temp_dir):
+        if stop_after["remaining"] == 0:
+            raise UiPrintInterrupted("收到停止请求")
+        stop_after["remaining"] -= 1
+        submitted.append(case.case_id)
+        return "ui-automation", Path(source_path).stem
+
+    pdf = tmp_path / "sample.docx"
+    pdf.write_bytes(b"PK")
+    first = [
+        PrintCase(case_id=f"TC-A{i}", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
+        for i in range(3)
+    ]
+    second = [
+        PrintCase(case_id=f"TC-B{i}", enabled=True, file_path=str(pdf), resolved_path=pdf, printer="Test Printer")
+        for i in range(2)
+    ]
+    runner = PrintRunner(
+        spooler, AuditStore(tmp_path / "audit.sqlite3"), queue_timeout=1,
+        submitter=fake_submitter(), driver_applier=fake_driver_applier(),
+        ui_submitter=ui_submit,
+    )
+    first_results = runner.run_cases(first, "Test Printer", "RUN008", lambda *_: None)
+    assert first_results[0].status != CaseStatus.STOPPED
+    assert first_results[1].status == CaseStatus.STOPPED
+
+    # 第二批：run_cases 会清掉上一批的停止标记
+    stop_after["remaining"] = 5
+    second_results = runner.run_cases(second, "Test Printer", "RUN009", lambda *_: None)
+    assert submitted == ["TC-A0", "TC-B0", "TC-B1"]
+    assert all(item.status != CaseStatus.STOPPED for item in second_results)

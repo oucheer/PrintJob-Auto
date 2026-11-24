@@ -32,6 +32,14 @@ from .extended_attrs import (
 )
 from .models import PrintCase
 from .office import WPS_PROG_IDS
+from .winnative import (
+    enum_top_windows,
+    process_alive,
+    process_name,
+    terminate_pid,
+    window_pid,
+    window_title,
+)
 
 UI_PRINTABLE_EXTENSIONS = {".docx", ".doc", ".rtf", ".odt", ".wps", ".wpt"}
 
@@ -61,6 +69,10 @@ DUPLEX_TOKENS = {
 
 class UiPrintError(RuntimeError):
     """UI 自动化打印失败（窗口/控件未找到、属性无法设置等）。"""
+
+
+class UiPrintInterrupted(UiPrintError):
+    """用户在执行过程中点击了“停止”，本次下发被主动中止。"""
 
 
 def _norm(text: object) -> str:
@@ -143,15 +155,127 @@ def _default_desktop():
     return Desktop(backend="uia")
 
 
-def _find_window(desktop, title: str, timeout: float):
-    """按标题找文档窗口（标题包含文件名主干）。"""
-    def search():
-        for window in desktop.windows():
-            if _norm(title) and _norm(title) in _norm(_text_of(window)):
-                return window
+def _pause(seconds: float, should_stop=None) -> bool:
+    """等待一小段并响应停止请求；返回是否因“停止”提前结束。"""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            return True
+        time.sleep(min(0.1, max(0.02, deadline - time.monotonic())))
+    return bool(should_stop is not None and should_stop())
+
+
+def _desktop_windows(desktop) -> list:
+    """UIA 桌面窗口列表；引擎异常时当作没有窗口，不让整条链路崩掉。"""
+    try:
+        return list(desktop.windows())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _wrap_handle(desktop, hwnd: int):
+    """把原生句柄包装成 pywinauto 窗口对象；失败返回 None。"""
+    if not hwnd:
+        return None
+    try:
+        return desktop.window(handle=int(hwnd))
+    except Exception:  # noqa: BLE001
         return None
 
-    return _wait(search, timeout, f"未找到文档窗口：{title}（请确认文档已用 Word/WPS 打开）")
+
+def _native_document_handle(title: str, prefer_pid: int | None = None) -> int | None:
+    """原生枚举找文档窗口句柄：标题包含文件名主干，优先本进程启动的那个实例。"""
+    wanted = _norm(title)
+    if not wanted:
+        return None
+    candidates = [
+        hwnd for hwnd, text in enum_top_windows()
+        if wanted in _norm(text)
+    ]
+    if not candidates:
+        return None
+    if prefer_pid:
+        for hwnd in candidates:
+            if window_pid(hwnd) == prefer_pid:
+                return hwnd
+    return candidates[0]
+
+
+def _app_window_handle(app, title: str) -> int | None:
+    """Word/WPS 通过 COM 直接给出的窗口句柄（Documents.Open 返回后立即可用）。"""
+    if app is None:
+        return None
+    try:
+        hwnd = int(app.ActiveWindow.Hwnd)
+    except Exception:  # noqa: BLE001 - 没有活动文档/旧版 WPS 无该属性
+        return None
+    if not hwnd:
+        return None
+    wanted = _norm(title)
+    if wanted and wanted not in _norm(window_title(hwnd)):
+        return None
+    return hwnd
+
+
+DOC_WINDOW_POLL = 0.25         # 文档窗口轮询间隔
+DOC_WINDOW_UIA_RETRY = 4.0     # 原生一直找不到时，才低频试一次 UIA 全量枚举
+
+
+def _find_window(desktop, title: str, timeout: float, should_stop=None, app=None,
+                 prefer_pid: int | None = None, log: Callable[[str], None] | None = None):
+    """按标题找文档窗口（标题包含文件名主干）。
+
+    旧实现每 0.4 秒调一次 ``Desktop.windows()``（UIA 桌面全量枚举）。UIA 在这个
+    环境里会整体失效：文档明明开着、屏幕上看得见，枚举却返回不完整列表，于是
+    一路空等，把用例超时（90 秒）耗光——用户看到的就是“点停止后卡住不动”。
+    这里改成：COM 给的 HWND → 原生 EnumWindows（毫秒级）→ UIA 全量枚举兜底。
+    """
+    wanted = _norm(title)
+    started = time.monotonic()
+    deadline = started + max(1.0, float(timeout))
+    uia_next = started
+    wrap_error = ""
+    seen_titles: dict[int, str] = {}
+    while time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            raise UiPrintInterrupted("收到停止请求，已中止本次下发（等待文档窗口阶段）")
+        hwnd = _app_window_handle(app, title)
+        source = "COM 句柄"
+        if not hwnd:
+            hwnd = _native_document_handle(title, prefer_pid=prefer_pid)
+            source = "原生枚举"
+        if hwnd:
+            window = _wrap_handle(desktop, hwnd)
+            if window is not None:
+                if log is not None:
+                    log(
+                        f"文档窗口已就绪（{source}，用时 {time.monotonic() - started:.1f} 秒）："
+                        f"{window_title(hwnd) or title}"
+                    )
+                return window
+            wrap_error = f"窗口句柄 {hwnd} 已存在，但 UI 自动化读不到它"
+            seen_titles[hwnd] = window_title(hwnd)
+        elif time.monotonic() >= uia_next:
+            uia_next = time.monotonic() + DOC_WINDOW_UIA_RETRY
+            for window in _desktop_windows(desktop):
+                if wanted and wanted in _norm(_text_of(window)):
+                    if log is not None:
+                        log(f"文档窗口已就绪（UIA 兜底，用时 {time.monotonic() - started:.1f} 秒）：{_text_of(window)}")
+                    return window
+        _pause(DOC_WINDOW_POLL, should_stop)
+    detail = ""
+    if wrap_error:
+        detail = f"；{wrap_error}，请重启本程序后重试"
+    elif seen_titles:
+        detail = "；已检测到窗口但读不到控件树：" + "、".join(seen_titles.values())
+    else:
+        opened = [
+            text for _hwnd, text in enum_top_windows()
+            if "word" in text.casefold() or "wps" in text.casefold()
+        ]
+        if opened:
+            detail = "；当前桌面上的 Word/WPS 窗口：" + "、".join(opened[:3])
+    raise UiPrintError(f"未找到文档窗口：{title}（请确认文档已用 Word/WPS 打开）{detail}")
 
 
 def _find_print_dialog(desktop, timeout: float):
@@ -222,7 +346,7 @@ def _set_checkbox_field(container, labels, enabled: bool, field_name: str, log) 
     return False
 
 
-def _find_print_dialog_or_backstage(desktop, window, timeout: float):
+def _find_print_dialog_or_backstage(desktop, window, timeout: float, should_stop=None):
     """返回 (容器, 是否后台视图)。
 
     Word 2013+ 的 Ctrl+P 打开的是“打印”后台视图（嵌在主窗口内），
@@ -230,7 +354,9 @@ def _find_print_dialog_or_backstage(desktop, window, timeout: float):
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for candidate in desktop.windows():
+        if should_stop is not None and should_stop():
+            raise UiPrintInterrupted("收到停止请求，已中止本次下发（等待打印界面阶段）")
+        for candidate in _desktop_windows(desktop):
             try:
                 class_name = candidate.class_name()
             except Exception:  # noqa: WPS420
@@ -245,7 +371,7 @@ def _find_print_dialog_or_backstage(desktop, window, timeout: float):
             combo = None
         if combo is not None:
             return window, True
-        time.sleep(0.5)
+        _pause(0.35, should_stop)
     raise UiPrintError("未能调出打印界面（Ctrl+P 后未出现“打印”对话框或后台打印视图）。")
 
 
@@ -317,7 +443,7 @@ def _ensure_document_focus(window, log: Callable[[str], None] | None = None) -> 
     return False
 
 
-def _open_print_view(desktop, window, log: Callable[[str], None], timeout: float):
+def _open_print_view(desktop, window, log: Callable[[str], None], timeout: float, should_stop=None):
     """反复尝试 Ctrl+P 直到打印界面出现；返回 (容器, 是否后台视图)。
 
     单次尝试只等一小段，失败就重新聚焦再发一次 Ctrl+P，避免把一次被吞掉的
@@ -327,6 +453,8 @@ def _open_print_view(desktop, window, log: Callable[[str], None], timeout: float
     attempts = 0
     last_error = ""
     while attempts < PRINT_VIEW_MAX_ATTEMPTS and time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            raise UiPrintInterrupted("收到停止请求，已中止本次下发（调出打印界面阶段）")
         attempts += 1
         focused = _ensure_document_focus(window, log)
         try:
@@ -336,7 +464,9 @@ def _open_print_view(desktop, window, log: Callable[[str], None], timeout: float
         wait_for = min(PRINT_VIEW_WAIT_PER_TRY, max(1.0, deadline - time.monotonic()))
         log(f"已发送 Ctrl+P（第 {attempts} 次{f'，已聚焦正文' if focused else ''}），等待打印界面…")
         try:
-            return _find_print_dialog_or_backstage(desktop, window, wait_for)
+            return _find_print_dialog_or_backstage(desktop, window, wait_for, should_stop)
+        except UiPrintInterrupted:
+            raise
         except UiPrintError as exc:
             last_error = str(exc)
             if time.monotonic() >= deadline:
@@ -400,7 +530,7 @@ def _open_preferences(dialog, desktop, log: Callable[[str], None], timeout: floa
                 lambda: next(
                     (
                         window
-                        for window in desktop.windows()
+                        for window in _desktop_windows(desktop)
                         if window != dialog
                         and _matches_labels(_text_of(window), ("属性", "首选项", "preferences", "properties", "设置"))
                     ),
@@ -527,7 +657,7 @@ def _print_buttons(container) -> list[tuple[object, str]]:
 
 
 def _click_print_button(container, log: Callable[[str], None],
-                        wait: float = PRINT_BUTTON_READY_TIMEOUT) -> str | None:
+                        wait: float = PRINT_BUTTON_READY_TIMEOUT, should_stop=None) -> str | None:
     """点击“打印”按钮，返回实际点到的文本；找不到可点击的按钮返回 None。
 
     后台打印视图刚切换过来时，“打印”按钮可能还是禁用状态（预览仍在渲染），
@@ -536,6 +666,8 @@ def _click_print_button(container, log: Callable[[str], None],
     """
     deadline = time.monotonic() + max(0.0, wait)
     while True:
+        if should_stop is not None and should_stop():
+            raise UiPrintInterrupted("收到停止请求，已中止本次下发（等待“打印”按钮就绪阶段）")
         for button, text in _print_buttons(container):
             if not _button_enabled(button):
                 continue
@@ -543,7 +675,7 @@ def _click_print_button(container, log: Callable[[str], None],
             return text
         if time.monotonic() >= deadline:
             return None
-        time.sleep(0.2)
+        _pause(0.2, should_stop)
 
 
 def _print_view_gone(window) -> bool:
@@ -554,7 +686,7 @@ def _print_view_gone(window) -> bool:
         return False
 
 
-def _left_print_view(window, timeout: float) -> bool:
+def _left_print_view(window, timeout: float, should_stop=None) -> bool:
     """等 Word 后台打印视图关闭（回到文档）。
 
     点击“打印”后视图一定会关闭；视图不动说明这次点击没有被接受，
@@ -563,6 +695,8 @@ def _left_print_view(window, timeout: float) -> bool:
     """
     deadline = time.monotonic() + max(0.5, float(timeout))
     while time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            return True                     # 已点击过，停止请求不再回滚，按已点击处理
         if _print_view_gone(window):
             time.sleep(0.4)
             if _print_view_gone(window):
@@ -584,7 +718,8 @@ def _background_print_status(app) -> int | None:
 
 def _confirm_print_handoff(app, log: Callable[[str], None],
                            confirm_wait: float = PRINT_CONFIRM_WAIT,
-                           drain_timeout: float = PRINT_DRAIN_TIMEOUT) -> str:
+                           drain_timeout: float = PRINT_DRAIN_TIMEOUT,
+                           should_stop=None) -> str:
     """确认 Word 真的把作业交给了打印后台；返回 handoff / none。
 
     点击“打印”后 Word 会开一个后台打印任务。这里等它出现再等它落盘完成，
@@ -609,6 +744,10 @@ def _confirm_print_handoff(app, log: Callable[[str], None],
                 if status is None or status == 0:
                     log("Word 后台打印任务已全部交给打印后台，可以关闭文档")
                     return "handoff"
+                if should_stop is not None and should_stop():
+                    # 作业已经进了 Word 的后台打印队列，停止请求不再回滚，先等它落盘
+                    log("收到停止请求：作业已在 Word 后台打印队列中，先等它交给打印后台再关闭文档")
+                    should_stop = None      # 只提示一次，继续等落盘
                 time.sleep(0.2)
             log(f"Word 后台打印任务在 {drain_timeout:.0f} 秒内未结束，按已提交处理")
             return "handoff"
@@ -622,7 +761,7 @@ def _confirm_print_handoff(app, log: Callable[[str], None],
 
 
 def _open_document_visible(doc_path: Path, log: Callable[[str], None]):
-    """用 Word（优先）或 WPS 以可见方式打开文档，返回 (关闭函数, 窗口标题, 文档对象, 应用对象)。"""
+    """用 Word（优先）或 WPS 以可见方式打开文档，返回 (关闭函数, 窗口标题, 文档对象, 应用对象, 进程号)。"""
     import pythoncom  # noqa: WPS433
 
     pythoncom.CoInitialize()
@@ -663,6 +802,18 @@ def _open_document_visible(doc_path: Path, log: Callable[[str], None]):
         pass
     document = app.Documents.Open(str(doc_path), ReadOnly=True, AddToRecentFiles=False)
 
+    # 记录我们创建的实例进程号：退出失败时只能清理自己启动的这一个
+    pid = None
+    try:
+        pid = window_pid(int(app.ActiveWindow.Hwnd))
+    except Exception:  # noqa: BLE001
+        pid = None
+    if not pid:
+        try:
+            pid = window_pid(int(document.ActiveWindow.Hwnd))
+        except Exception:  # noqa: BLE001
+            pid = None
+
     def close() -> None:
         try:
             document.Close(False)
@@ -670,11 +821,26 @@ def _open_document_visible(doc_path: Path, log: Callable[[str], None]):
             pass
         try:
             app.Quit()
-        except Exception:  # noqa: WPS420
+        except Exception:  # noqa: BLE001
             pass
+        # Quit 是异步的：文档还在渲染/打印时 Word 可能不响应，进程会残留。
+        # 残留的 Word 会让下一次下发“文档窗口已开但读不到”，必须收干净。
+        if pid:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not process_alive(pid):
+                    break
+                time.sleep(0.2)
+            if process_alive(pid):
+                name = process_name(pid)
+                if name.startswith(("winword", "wps")):
+                    if terminate_pid(pid):
+                        log(f"文档进程 {name}({pid}) 未响应关闭请求，已结束该实例")
+                    else:
+                        log(f"文档进程 {name}({pid}) 未能关闭，请手工关闭残留的 Word/WPS 窗口")
         pythoncom.CoUninitialize()
 
-    return close, doc_path.stem, document, app
+    return close, doc_path.stem, document, app, pid
 
 
 def _default_opener(doc_path: Path, log: Callable[[str], None]):
@@ -874,11 +1040,16 @@ def print_with_ui(
     desktop=None,
     opener: Callable[..., tuple[Callable[[], None], str]] | None = None,
     set_driver_attributes: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[str, str]:
     """通过 UI 自动化（pywinauto）下发打印。返回 (通道标识, 作业名主干)。
 
     ``set_driver_attributes=False`` 表示属性已由 driver_ui 在驱动“打印首选项”
     里设置并回读确认，这里只负责打开文档、选择驱动、填份数/页码、点“打印”。
+
+    ``should_stop``：用户点“停止”时的判定函数。每个等待环节都会检查它，
+    命中即抛 UiPrintInterrupted（不算失败，用例记为“已停止”），不会让界面
+    卡在某个 90 秒的等待里。
     """
     source_path = Path(source_path)
     if source_path.suffix.lower() not in UI_PRINTABLE_EXTENSIONS:
@@ -896,10 +1067,13 @@ def print_with_ui(
 
     close_app = None
     try:
+        if should_stop is not None and should_stop():
+            raise UiPrintInterrupted("收到停止请求，尚未打开文档，本次不下发")
         opened = opener(source_path, log)
         close_app, title = opened[0], opened[1]
         document = opened[2] if len(opened) > 2 else None
         app = opened[3] if len(opened) > 3 else None
+        word_pid = opened[4] if len(opened) > 4 else None
 
         # 扩展属性：WPS 页面布局（必须在调出打印对话框前设置，影响分页）
         wps_attrs = [attr for attr in (case.extended_attrs or []) if attr.page == "wps_page"]
@@ -910,10 +1084,14 @@ def print_with_ui(
             if wps_unresolved:
                 raise UiPrintError("WPS 页面布局属性无法设置：" + "、".join(wps_unresolved))
 
-        window = _find_window(desktop, title, timeout)
+        window = _find_window(
+            desktop, title, timeout, should_stop=should_stop,
+            app=app, prefer_pid=word_pid, log=log,
+        )
         log(f"文档窗口已就绪：{_text_of(window) or title}")
 
-        container, backstage = _open_print_view(desktop, window, log, timeout)
+        container, backstage = _open_print_view(desktop, window, log, timeout, should_stop)
+
         log("打印界面已就绪（%s），开始选择打印机驱动" % ("后台打印视图" if backstage else "打印对话框"))
         if backstage:
             _select_printer_in_backstage(window, printer, log)
@@ -948,7 +1126,7 @@ def print_with_ui(
 
         clicked_text = None
         for attempt in range(1, PRINT_CLICK_ATTEMPTS + 1):
-            clicked_text = _click_print_button(container, log)
+            clicked_text = _click_print_button(container, log, should_stop=should_stop)
             if clicked_text is None:
                 if backstage and _print_view_gone(window):
                     # 按钮已经随视图消失：说明上一轮点击其实生效了
@@ -962,7 +1140,7 @@ def print_with_ui(
                 log(f"已点击“{clicked_text}”，等待打印对话框关闭")
                 break
             log(f"已点击“{clicked_text}”（第 {attempt} 次），等待打印视图关闭…")
-            if _left_print_view(window, PRINT_START_TIMEOUT):
+            if _left_print_view(window, PRINT_START_TIMEOUT, should_stop):
                 log("打印视图已关闭，Word 已接受打印指令")
                 break
             if attempt < PRINT_CLICK_ATTEMPTS:
@@ -974,7 +1152,7 @@ def print_with_ui(
             )
 
         if backstage:
-            outcome = _confirm_print_handoff(app, log)
+            outcome = _confirm_print_handoff(app, log, should_stop=should_stop)
         else:
             outcome = "dialog"
 

@@ -132,6 +132,7 @@ class PrintCaseApp:
         self.event_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.running = False
+        self._stop_requested = False
         self.audit = AuditStore(data_dir() / "history.sqlite3")
         self.run_log: RunLog | None = None
         self.log_path: Path | None = None
@@ -1068,6 +1069,7 @@ class PrintCaseApp:
         self.run_results = list(preflight_results)
         self.runner = PrintRunner(self.printer, self.audit)
         self.running = True
+        self._stop_requested = False
         self._set_running_ui(True)
         self.status_var.set(f"执行中 · RUN {self.run_id}")
         self._open_run_log()
@@ -1085,10 +1087,12 @@ class PrintCaseApp:
 
     def _stop_run(self) -> None:
         if self.runner and self.running:
+            self._stop_requested = True
             self.runner.stop()
-            self.status_var.set("正在停止：当前作业可能已经进入打印队列")
-            self._log("收到停止请求：将停止后续用例，不会假定当前打印作业已撤回；"
-                      "当前用例结束后会自动清理驱动属性页残留，便于马上再下发下一批。")
+            self.status_var.set("正在停止：正在下发的用例会立即中止")
+            self._log("收到停止请求：当前正在下发的用例会立即中止，后续用例不再下发；"
+                      "已经进入打印队列的作业不会被撤回，请到队列中核对。"
+                      "停止后会自动清理文档窗口/驱动属性页残留，可以直接再下发下一批。")
             if self.run_log is not None:
                 self._log(f"完整过程见日志文件：{self.run_log.path}")
             self.btn_stop.configure(state="disabled")
@@ -1118,7 +1122,10 @@ class PrintCaseApp:
                 elif kind == "finished":
                     self.running = False
                     self._set_running_ui(False)
-                    self.status_var.set(f"执行完成 · RUN {payload}")
+                    if self._stop_requested:
+                        self.status_var.set(f"已停止（按用户请求，剩余用例未下发）· RUN {payload}")
+                    else:
+                        self.status_var.set(f"执行完成 · RUN {payload}")
                     self._log(f"===== 执行结束 RUN {payload} =====")
                     self._close_run_log()
                     self._update_kpis()

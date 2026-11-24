@@ -622,3 +622,130 @@ def test_print_button_waits_until_enabled(tmp_path, monkeypatch):
 
     assert button.disabled_clicks == 0        # 从没在禁用状态下点击
     assert combo not in window.children       # 点击生效，视图关闭
+
+
+# ---------- 文档窗口发现：UIA 全量枚举失效时的原生兜底 ----------
+class HandleDesktop:
+    """模拟真实故障：UIA 全量枚举（windows()）整体失效，但按句柄还能拿到窗口。"""
+
+    def __init__(self, windows_by_handle=None):
+        self._by_handle = {int(h): w for h, w in (windows_by_handle or {}).items()}
+        self.enumerations = 0
+
+    def windows(self):
+        self.enumerations += 1
+        return []
+
+    def window(self, handle):  # noqa: A003 - 与 pywinauto 接口保持一致
+        return self._by_handle[int(handle)]
+
+
+def test_document_window_found_by_native_handle_when_uia_enumeration_broken(tmp_path, monkeypatch):
+    """UIA 枚举返回空（真实故障）时，必须靠原生句柄找到文档窗口，而不是白等到超时。"""
+    import time
+
+    from printcase import ui_print
+
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    window = FakeWindow("报告.docx - 兼容性模式 - Word", class_name="OpusApp")
+    desktop = HandleDesktop({4321: window})
+    monkeypatch.setattr(
+        ui_print, "enum_top_windows",
+        lambda: [(4321, "报告.docx  -  兼容性模式 - Word"), (999, "打印首选项")],
+    )
+    monkeypatch.setattr(ui_print, "window_pid", lambda _hwnd: 4242)
+
+    logs = []
+    started = time.monotonic()
+    found = ui_print._find_window(
+        desktop, "报告", timeout=5, prefer_pid=4242, log=logs.append,
+    )
+    assert found is window
+    assert time.monotonic() - started < 2.0          # 毫秒级，不是 5 秒空等
+    assert desktop.enumerations == 0                 # 完全没走 UIA 全量枚举
+    assert "原生枚举" in "\n".join(logs)
+
+
+def test_document_window_prefers_com_handle(tmp_path, monkeypatch):
+    from printcase import ui_print
+
+    window = FakeWindow("报告.docx - Word", class_name="OpusApp")
+    desktop = HandleDesktop({777: window})
+
+    class App:
+        class ActiveWindow:  # noqa: N801 - 模拟 Word COM 对象
+            Hwnd = 777
+
+    monkeypatch.setattr(ui_print, "window_title", lambda _hwnd: "报告.docx - Word")
+    desktop.windows = lambda: (_ for _ in ()).throw(AssertionError("不应走 UIA 枚举"))
+
+    found = ui_print._find_window(desktop, "报告", timeout=2, app=App(), log=lambda _t: None)
+    assert found is window
+
+
+def test_find_window_aborts_immediately_on_stop(tmp_path):
+    """点“停止”后不能继续枯等文档窗口（旧实现会把 90 秒超时走完）。"""
+    import time
+
+    from printcase import ui_print
+    from printcase.ui_print import UiPrintInterrupted
+
+    started = time.monotonic()
+    with pytest.raises(UiPrintInterrupted):
+        ui_print._find_window(HandleDesktop(), "报告", timeout=30, should_stop=lambda: True)
+    assert time.monotonic() - started < 2.0
+
+
+def test_print_with_ui_stops_before_opening_document(tmp_path):
+    from printcase.ui_print import UiPrintInterrupted
+
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    opened = []
+
+    def opener(_path, _log):
+        opened.append(1)
+        return (lambda: None), "报告"
+
+    with pytest.raises(UiPrintInterrupted):
+        print_with_ui(
+            "Pantum CM806ADN", make_case(copies=1), docx, lambda _t: None,
+            timeout=3, desktop=FakeDesktop([]), opener=opener,
+            set_driver_attributes=False, should_stop=lambda: True,
+        )
+    assert opened == []          # 已停止：不再启动 Word
+
+
+def test_print_with_ui_stops_while_waiting_print_view(tmp_path, monkeypatch):
+    """停止请求在等待打印界面期间到达：应当立刻中止并关闭文档，而不是等满超时。"""
+    import time
+
+    from printcase import ui_print
+    from printcase.ui_print import UiPrintInterrupted
+
+    monkeypatch.setattr(ui_print, "PRINT_VIEW_WAIT_PER_TRY", 5.0)
+    monkeypatch.setattr(ui_print, "PRINT_VIEW_MAX_ATTEMPTS", 6)
+    docx = tmp_path / "报告.docx"
+    docx.write_bytes(b"PK")
+    window = FakeWindow("报告.docx - Word", class_name="OpusApp")   # 永远没有打印视图
+    closed = []
+
+    def opener(_path, _log):
+        return (lambda: closed.append(True)), "报告"
+
+    ticks = {"n": 0}
+
+    def should_stop() -> bool:
+        ticks["n"] += 1
+        return ticks["n"] > 12
+
+    started = time.monotonic()
+    with pytest.raises(UiPrintInterrupted):
+        print_with_ui(
+            "Pantum CM806ADN", make_case(copies=1), docx, lambda _t: None,
+            timeout=60, desktop=FakeDesktop([window]), opener=opener,
+            set_driver_attributes=False, should_stop=should_stop,
+        )
+    assert time.monotonic() - started < 8.0
+    assert closed == [True]                      # 文档被关闭，不留残窗
