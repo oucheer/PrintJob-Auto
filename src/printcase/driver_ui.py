@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .extended_attrs import ExtendedAttr
 from .models import PrintCase
 from .ui_print import _best_match, _descendants, _matches_labels, _norm
 from .ui_print import _text_of as _uia_text_of
@@ -123,6 +124,10 @@ def plan_actions(case: PrintCase, caps: dict | None = None) -> list[Action]:
     bin_value = str(case.bin or "").strip()
     if bin_value:
         bin_index = _index_in_names(bin_value, caps.get("bin_names")) if not bin_value.isdigit() else None
+        if bin_index is not None and _norm((caps.get("bin_names") or [])[bin_index]) != _norm(bin_value):
+            # “纸盒1/纸盒3”这类编号名不能用包含匹配：DC_BINNAMES 报的是 纸盒3/纸盒4，
+            # 误配成序号会把“纸盒1”点到别的盒上。只有精确同名才走序号，否则按名称选。
+            bin_index = None
         bin_ids = caps.get("bin_ids") or []
         expected_bin = bin_ids[bin_index] if bin_index is not None and bin_index < len(bin_ids) else (int(bin_value) if bin_value.isdigit() else None)
         if bin_index is not None:
@@ -162,6 +167,49 @@ def plan_actions(case: PrintCase, caps: dict | None = None) -> list[Action]:
         actions.append(Action(TAB_LAYOUT, "无边距", "toggle", True))
 
     return actions
+
+
+# 用例“分隔页”列 → 驱动纸张页“输出→分隔页”下拉。真机实测该下拉只有这两个值
+# （没有“前/后/前后”，也没有“无”），所以不再由软件另打一张 PDF 充数。
+SEPARATOR_DRIVER_VALUES = {"job": "作业之间", "copies": "份数之间"}
+
+
+def separator_attrs(case: PrintCase) -> list[ExtendedAttr]:
+    """把用例“分隔页”列翻译成驱动“纸张→输出”分组的设置。
+
+    驱动的硬性前置条件（真机验证）：**纸张来源必须是具体纸盒**，为“自动选择”时
+    “输出/分隔页”整组灰化；并且要先选中“输出→分隔页”单选，下面的下拉才可用。
+    这两步由 apply_driver_attrs 里的“输出模式”/“分隔页”处理，这里只负责生成顺序。
+    """
+    value = SEPARATOR_DRIVER_VALUES.get(str(case.separator_page or "").lower())
+    if value is None:
+        # 分隔页=无：驱动默认设置是全局的，上一轮可能把它留在“分隔页”（本账户没有
+        # 写回默认 DEVMODE 的权限，结束时不一定能还原），这里必须显式关掉，
+        # 否则这条用例会莫名多出一张分隔页。
+        return [ExtendedAttr("driver_paper", "输出模式", "正常")]
+    if not str(case.bin or "").strip():
+        raise DriverUiError(
+            f"分隔页={value} 需要先在“纸盒”列指定具体纸盒（纸盒1/纸盒2）："
+            "纸张来源为“自动选择”时，驱动会把“输出/分隔页”整组灰化，设置不进去。"
+        )
+    attrs = [
+        ExtendedAttr("driver_paper", "输出模式", "分隔页"),
+        ExtendedAttr("driver_paper", "分隔页", value),
+    ]
+    if str(case.separator_bin or "").strip():
+        attrs.append(ExtendedAttr("driver_paper", "分隔页（OHP插页）纸张来源", str(case.separator_bin).strip()))
+    return attrs
+
+
+def _with_separator_attrs(case: PrintCase) -> list[ExtendedAttr]:
+    """用例的扩展属性 + 由“分隔页”列推导出的驱动设置（同名以用户手填为准）。"""
+    attrs = list(case.extended_attrs or [])
+    taken = {item.label for item in attrs}
+    for item in separator_attrs(case):
+        if item.label not in taken:
+            attrs.append(item)
+            taken.add(item.label)
+    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +700,14 @@ def _combo_items_wrappers(combo) -> list:
     ]
 
 
+def _combo_option_texts(combo) -> list[str]:
+    """读取下拉框可选条目文字（读不到返回空列表）。"""
+    try:
+        return [_text_of(item).strip() for item in _combo_items_wrappers(combo) if _text_of(item).strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _select_combo_index(combo, index: int) -> None:
     """按序号选中下拉项：优先展开后直接点第 index 个条目。
 
@@ -768,6 +824,12 @@ def _apply_action(window, action: Action, log=None) -> None:
         else:
             # 驱动能读到条目时按名称选；读不到（自绘下拉）时给出明确原因
             if not _select_combo_text(combo, str(action.value)):
+                options = _combo_option_texts(combo)
+                if options:
+                    raise DriverUiError(
+                        f"驱动“{action.label}”下拉里没有“{action.value}”"
+                        f"（可选：{'、'.join(options)}）；请把用例里的取值改成驱动真实条目。"
+                    )
                 raise DriverUiError(
                     f"驱动未暴露“{action.label}”的可读条目，无法按名称选择“{action.value}”；"
                     "请改用驱动下拉里的完整名称，或填数字序号。"
@@ -975,8 +1037,9 @@ def apply_case(
 ) -> Callable[[], None]:
     """按用例在驱动属性页设置属性，回读确认后返回还原函数。"""
     actions = plan_actions(case, caps)
+    attrs = _with_separator_attrs(case)
     before = snapshot(printer, w=w)
-    if not actions and not case.extended_attrs:
+    if not actions and not attrs:
         if log:
             log("用例未填写需要驱动界面设置的属性，保留驱动当前默认设置。")
         return lambda: None
@@ -993,8 +1056,8 @@ def apply_case(
             for action in [item for item in actions if item.page == page]:
                 if _apply_action(window, action, log) is False:
                     unchanged.add(action.label)
-        if case.extended_attrs:
-            unresolved = _apply_extended(window, case.extended_attrs, log)
+        if attrs:
+            unresolved = _apply_extended(window, attrs, log)
             if unresolved:
                 raise DriverUiError("以下驱动扩展属性无法在驱动界面设置：" + "、".join(unresolved))
         _confirm(window, log)

@@ -41,16 +41,11 @@ def validate_driver_capabilities(case: PrintCase, caps: dict | None) -> list[str
         errors.append("驱动能力检查：该打印机未报告双面打印能力")
     if case.color.lower() == "color" and caps.get("color") is False:
         errors.append("驱动能力检查：该打印机未报告彩色打印能力")
-    if case.bin:
-        bin_names = caps.get("bin_names")
-        bin_ids = caps.get("bin_ids")
-        if bin_names is not None or bin_ids is not None:
-            wanted = case.bin.strip()
-            name_match = bool(bin_names) and any(_norm(wanted) == _norm(x) or _norm(wanted) in _norm(x) for x in bin_names)
-            id_match = bool(bin_ids) and wanted.isdigit() and int(wanted) in bin_ids
-            if not name_match and not id_match:
-                known = ", ".join(bin_names or []) or ", ".join(str(x) for x in (bin_ids or []))
-                errors.append(f"驱动能力检查：未发现纸盒/进纸器 {wanted}（可用：{known or '驱动未提供列表'}）")
+    # 纸盒不在这里核验：DC_BINNAMES 是驱动的“标准纸盒表”，常常与属性页“纸张→来源”
+    # 下拉的真实条目对不上（本机实测：属性页只有 自动选择/多功能进纸器/纸盒1/纸盒2，
+    # DC_BINNAMES 却报 纸盒3/纸盒4/内置大容量纸盒），据此拦截会误伤合法用例。
+    # 纸盒最终是在驱动属性页里按名称点选的，因此改由设置属性时按下拉实际条目报错
+    # （见 driver_ui._apply_action 的“下拉里没有…”提示）。
     media = str(case.media_type or "").strip()
     if media and not media.isdigit() and not _media_reported(media, caps.get("media_names")):
         available = "、".join((caps.get("media_names") or [])[:8])

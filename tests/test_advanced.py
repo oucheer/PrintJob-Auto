@@ -7,7 +7,6 @@ from printcase.models import CaseStatus, PrintCase
 from printcase.office import DocumentConversionError, convert_document_to_pdf
 from printcase.audit import AuditStore
 from printcase.runner import PrintRunner
-from printcase.separator import build_separator_pdf
 from printcase.spooler import QueueJob
 from printcase.validator import validate_case
 
@@ -44,7 +43,7 @@ def test_advanced_print_attributes_validate(tmp_path):
     pdf.write_bytes(b"%PDF")
     case = _make_case(
         tmp_path,
-        borderless="yes", separator_page="both",
+        borderless="yes", separator_page="job", bin="纸盒1",
         binding_location="left", binding_method="staple", duplex="simplex",
     )
     assert validate_case(case, {"Test Printer"}) == []
@@ -88,7 +87,7 @@ def test_chinese_excel_values_map_to_canonical_settings(tmp_path):
                "颜色", "单双面", "缩放", "纸盒", "无边距", "分隔页", "装订位置", "装订方式",
                "超时秒", "备注"])
     ws.append(["TC-CN", "是", "sample.docx", "", "1-3", 2, "混合", "横向",
-               "黑白", "双面短边", "不缩放", "2", "是", "前后", "长边", "骑马钉", 60, "中文模板回环"])
+               "黑白", "双面短边", "不缩放", "2", "是", "作业之间", "长边", "骑马钉", 60, "中文模板回环"])
     doc = tmp_path / "sample.docx"
     doc.write_bytes(b"PK")
     wb.save(xlsx)
@@ -103,7 +102,7 @@ def test_chinese_excel_values_map_to_canonical_settings(tmp_path):
     assert case.scaling == "noscale"
     assert case.bin == "2"
     assert case.borderless == "yes"
-    assert case.separator_page == "both"
+    assert case.separator_page == "job"
     assert case.binding_location == "longedge"
     assert case.binding_method == "saddle"
     assert case.settings_summary().count("装订") == 1
@@ -120,17 +119,6 @@ def test_repository_template_is_fully_chinese_and_parses():
     for case in cases:
         if case.enabled and case.file_path:
             assert validate_case(case, {"Test Printer"}, "Test Printer") == [], case.case_id
-
-
-def test_separator_pdf_is_generated_and_ascii_safe(tmp_path):
-    dest = tmp_path / "sep" / "separator.pdf"
-    result = build_separator_pdf(dest, ["PrintCase Separator", "Case: TC-001 中文", "job info"])
-    raw = result.read_bytes()
-    assert result == dest and dest.stat().st_size > 0
-    assert raw.startswith(b"%PDF-1.4")
-    assert raw.rstrip().endswith(b"%%EOF")
-    assert b"(Case: TC-001 ??)" in raw  # 中文被替换为 ?，PDF 结构仍有效
-    assert b"(job info)" in raw
 
 
 class JobThenClearSpooler(FakeSpooler):
@@ -203,7 +191,8 @@ def test_runner_reports_failure_when_conversion_is_unavailable(tmp_path):
     assert "转 PDF" in result.message
 
 
-def test_runner_prints_separator_pages_before_and_after(tmp_path):
+def test_runner_uses_driver_separator_without_extra_jobs(tmp_path):
+    """分隔页不再是“软件另打一张 PDF 充数”：只下发一个作业，设置交给驱动。"""
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF")
     launched = []
@@ -214,14 +203,12 @@ def test_runner_prints_separator_pages_before_and_after(tmp_path):
 
     case = PrintCase(
         case_id="TC-SEP", enabled=True, file_path=str(pdf), resolved_path=pdf,
-        printer="Test Printer", separator_page="both",
+        printer="Test Printer", separator_page="job", bin="纸盒1",
     )
     runner = PrintRunner(JobThenClearSpooler(), AuditStore(tmp_path / "a3.sqlite3"), queue_timeout=1, submitter=submit, driver_applier=fake_driver_applier())
     result = runner.run_cases([case], "Test Printer", "R3", lambda *_: None)[0]
     assert result.status == CaseStatus.QUEUE_CLEARED
-    names = [c for c, _ in launched]
-    assert names == ["TC-SEP-before", "TC-SEP", "TC-SEP-after"]
-    assert all(name.endswith(".pdf") for _, name in launched)
+    assert [case_id for case_id, _name in launched] == ["TC-SEP"]   # 只有主作业，没有额外分隔页作业
 
 
 class FakeWordDoc:
@@ -309,12 +296,25 @@ def test_mixed_sizes_switch_rules(tmp_path):
     assert any("混合尺寸必须" in e for e in validate_case(bad_value, set()))
 
 
-def test_separator_each_copy_mode_accepted(tmp_path):
+def test_separator_copies_mode_accepted(tmp_path):
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(b"%PDF")
-    case = _make_case(tmp_path, resolved_path=pdf, separator_page="each_copy", copies=5)
+    case = _make_case(tmp_path, resolved_path=pdf, separator_page="copies", copies=5, bin="纸盒1")
     assert validate_case(case, {"Test Printer"}, "Test Printer") == []
-    assert "份间" in case.settings_summary()
+    assert "份数之间" in case.settings_summary()
+
+
+def test_separator_old_values_rejected_and_tray_required(tmp_path):
+    """模板里只剩 无/作业之间/份数之间；旧的前/后/前后 直接判错，不再假装支持。"""
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF")
+    for old in ("before", "after", "both", "each_copy"):
+        case = _make_case(tmp_path, resolved_path=pdf, separator_page=old, bin="纸盒1")
+        errors = validate_case(case, {"Test Printer"}, "Test Printer")
+        assert any("分隔页必须为" in e for e in errors), old
+    # 驱动在“纸张来源=自动选择”时会把“输出/分隔页”整组灰化：必须指定具体纸盒
+    need_bin = _make_case(tmp_path, resolved_path=pdf, separator_page="job", bin="")
+    assert any("具体纸盒" in e for e in validate_case(need_bin, {"Test Printer"}, "Test Printer"))
 
 
 def test_chinese_excel_new_columns_map(tmp_path):
@@ -336,13 +336,12 @@ def test_chinese_excel_new_columns_map(tmp_path):
     assert case.print_quality == "600"
     assert case.media_type == "普通纸"
     assert case.skip_blank == "yes"
-    assert case.separator_page == "each_copy"
+    assert case.separator_page == "copies"
     assert case.separator_bin == "多功能进纸器"
 
 
-def test_runner_each_copy_prints_separator_between_copies(tmp_path):
-    from dataclasses import replace as dc_replace
-
+def test_runner_keeps_copies_in_one_job_for_copies_separator(tmp_path):
+    """分隔页=份数之间 由驱动在份与份之间插入，份数仍按一个作业提交。"""
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF")
     launched = []
@@ -353,7 +352,7 @@ def test_runner_each_copy_prints_separator_between_copies(tmp_path):
 
     case = PrintCase(
         case_id="TC-BETW", enabled=True, file_path=str(pdf), resolved_path=pdf,
-        printer="Test Printer", copies=3, separator_page="each_copy",
+        printer="Test Printer", copies=3, separator_page="copies", bin="纸盒1",
     )
     runner = PrintRunner(
         JobThenClearSpooler(), AuditStore(tmp_path / "a4.sqlite3"),
@@ -361,10 +360,7 @@ def test_runner_each_copy_prints_separator_between_copies(tmp_path):
     )
     result = runner.run_cases([case], "Test Printer", "R4", lambda *_: None)[0]
     assert result.status == CaseStatus.QUEUE_CLEARED
-    ids = [c for c, _, _ in launched]
-    copies = [n for _, n, _ in launched]
-    assert ids == ["TC-BETW", "TC-BETW-第2份前", "TC-BETW", "TC-BETW-第3份前", "TC-BETW"]
-    assert copies == [1, 1, 1, 1, 1]  # 主文档按单份逐个下发，分隔页作业固定为单份
+    assert launched == [("TC-BETW", 3, "sample.pdf")]
 
 
 # ---------- 驱动属性页操作计划（driver_ui.plan_actions） ----------
@@ -631,6 +627,17 @@ def test_plan_resolves_paper_and_tray_from_driver_caps(tmp_path):
     assert _action(actions, "纸张尺寸").expect_value == 130
     assert _action(actions, "纸张来源").value == 2
     assert _action(actions, "纸张来源").expect_value == 1
+
+
+def test_tray_missing_from_driver_table_falls_back_to_name_match(tmp_path):
+    """驱动上报的纸盒表与用例取值对不上时按名称选，不能靠序号误配到别的盒。"""
+    from printcase.driver_ui import plan_actions
+
+    caps = {"bin_names": ["自动选择", "多功能进纸器", "纸盒3", "纸盒4"], "bin_ids": [7, 262, 259, 258]}
+    case = _make_case(tmp_path, bin="纸盒1")
+    action = _action(plan_actions(case, caps), "纸张来源")
+    assert action.kind == "combo_text" and action.value == "纸盒1"
+    assert action.expect_value is None
 
 
 def test_template_matches_driver_dropdown_options():

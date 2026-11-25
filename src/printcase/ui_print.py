@@ -1041,24 +1041,51 @@ def _find_combo(container, label_text: str):
 
 
 def _select_radio(container, words, log: Callable[[str], None] | None = None, description: str = "") -> bool:
-    """按文字点单选按钮（驱动把“输出”做成 正常/分隔页/OHP插页 三个单选项）。"""
+    """按文字点单选按钮（驱动把“输出”做成 正常/分隔页/OHP插页 三个单选项）。
+
+    已经是目标项就不再点（纸张来源为“自动选择”时整组灰化，点了也没用）；
+    点完要回读选中状态，点不动就返回 False，不把“没生效”当成功。
+    """
     labels = words if isinstance(words, (tuple, list)) else (words,)
     for radio in _descendants(container, control_type="RadioButton"):
         text = _text_of(radio)
         if not text.strip():
             continue
-        if _matches_labels(text, labels):
+        if not _matches_labels(text, labels):
+            continue
+        try:
+            if radio.is_selected():
+                if log:
+                    log(f"{description or '驱动属性'}：“{text.strip()}”已是选中项")
+                return True
+        except Exception:  # noqa: BLE001 - 个别控件读不到选中状态，按下面对待
+            pass
+        try:
             radio.click_input()
-            time.sleep(0.25)
-            if log:
-                log(f"{description or '驱动属性'}：选择“{text.strip()}”")
-            return True
+        except Exception:  # noqa: BLE001
+            return False
+        time.sleep(0.25)
+        try:
+            selected = bool(radio.is_selected())
+        except Exception:  # noqa: BLE001 - 读不到状态时按已点击处理
+            selected = True
+        if selected and log:
+            log(f"{description or '驱动属性'}：选择“{text.strip()}”")
+        return selected
     return False
 
 
 # 纸张页“输出”分组里的分隔页下拉；它必须先把“纸张来源”指到具体纸盒才可用
+SEPARATOR_LABEL = "分隔页"
 SEPARATOR_LABELS = ("分隔页", "分隔页（OHP插页）纸张来源")
 SEPARATOR_SOURCE_LABELS = ("来源", "纸张来源")
+# 模板里给用户看的属性名 → 驱动界面上的实际标签（真机 audit_driver_options 实测）：
+# - 主纸张来源那行视觉标签是“来源”（“纸张来源”是分隔页下面那行，容易张冠李戴）；
+# - “分隔页”下面那行只叫“纸张来源”，模板为了区分写成了“分隔页（OHP插页）纸张来源”。
+LABEL_ALIASES = {
+    "纸张来源": "来源",
+    "分隔页（OHP插页）纸张来源": "纸张来源",
+}
 
 
 def _separator_prerequisite(container, label_text: str) -> str:
@@ -1101,8 +1128,8 @@ def _ensure_separator_enabled(container, label_text: str, log: Callable[[str], N
 
 
 def _set_choice_control(container, label: str, value: str, log: Callable[[str], None], description: str = "") -> bool:
-    label_text = base_label(label)
-    if any(_norm(label_text) == _norm(name) for name in SEPARATOR_LABELS):
+    label_text = LABEL_ALIASES.get(base_label(label), base_label(label))
+    if _norm(label_text) == _norm(SEPARATOR_LABEL):
         _ensure_separator_enabled(container, label_text, log)
     combo = _find_combo(container, label_text)
     if combo is None:
@@ -1186,7 +1213,7 @@ def apply_driver_attrs(driver_window, attrs: list[ExtendedAttr], log: Callable[[
                         # 纸张页“输出”分组：正常/分隔页/OHP插页，是单选按钮不是下拉
                         if not _select_radio(driver_window, (attr.value,), log, "驱动属性"):
                             unresolved.append(f"输出模式={attr.value}（未找到该单选项）")
-                    elif (any(_norm(base_label(attr.label)) == _norm(name) for name in SEPARATOR_LABELS)
+                    elif (_norm(base_label(attr.label)) == _norm(SEPARATOR_LABEL)
                           and _norm(attr.value) in {_norm("无"), _norm("关闭"), _norm("正常")}):
                         # 驱动没有“无”这一项：等于把“输出”切回“正常”
                         if _select_radio(driver_window, ("正常",), log, "驱动属性"):

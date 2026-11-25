@@ -57,11 +57,9 @@ VALUE_ALIASES: dict[str, dict[str, str]] = {
     "skip_blank": {"是": "yes", "开": "yes", "开启": "yes", "否": "no", "关": "no", "关闭": "no"},
     "print_quality": {"自动": "auto", "默认": "auto"},
     "separator_page": {
-        "无": "none", "否": "none", "不插入": "none",
-        "前": "before", "打印前": "before", "作业前": "before",
-        "后": "after", "打印后": "after", "作业后": "after",
-        "前后": "both", "前后均插入": "both", "是": "both",
-        "份数之间": "each_copy", "每份之间": "each_copy", "份间": "each_copy", "逐份之间": "each_copy",
+        "无": "none", "否": "none", "不插入": "none", "关闭": "none", "正常": "none",
+        "作业之间": "job", "作业与作业之间": "job", "作业间": "job",
+        "份数之间": "copies", "每份之间": "copies", "份间": "copies", "逐份之间": "copies",
     },
     "binding_location": {
         "无": "none", "不装订": "none",

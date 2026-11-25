@@ -585,7 +585,7 @@ class PrintCaseApp:
         "color": {"color": "彩色", "monochrome": "黑白"},
         "duplex": {"simplex": "单面", "duplex": "双面", "duplexlong": "双面长边", "duplexshort": "双面短边"},
         "collate": {"yes": "逐份", "no": "非逐份", "": "驱动默认"},
-        "separator": {"none": "无", "before": "前", "after": "后", "both": "前后", "each_copy": "份数之间"},
+        "separator": {"none": "无", "job": "作业之间", "copies": "份数之间"},
         "binding_loc": {"none": "无", "left": "左", "right": "右", "top": "上", "bottom": "下", "longedge": "长边", "shortedge": "短边"},
         "binding_method": {"none": "无", "staple": "订书钉", "saddle": "骑马钉", "punch": "打孔", "glue": "胶装"},
     }

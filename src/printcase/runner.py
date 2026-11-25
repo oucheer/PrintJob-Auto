@@ -4,7 +4,6 @@ import shutil
 import tempfile
 import threading
 import time
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -16,7 +15,6 @@ from .models import CaseResult, CaseStatus, PrintCase
 from .office import DocumentConversionError
 from .queue_watch import ERROR_JOB_MASKS, QueueWatcher
 from .ui_print import UI_PRINTABLE_EXTENSIONS, UiPrintError, UiPrintInterrupted, print_with_ui
-from .separator import create_case_separator_pdf
 from .validator import normalize_paper, validate_case
 
 
@@ -269,18 +267,19 @@ class PrintRunner:
             source_path = Path(case.resolved_path or case.file_path)
             temp_dir = Path(tempfile.mkdtemp(prefix="printcase_job_"))
 
-            each_copy_mode = case.separator_page == "each_copy" and case.copies > 1
-            if not each_copy_mode and case.separator_page in {"before", "both"}:
-                self._print_separator_page(case, printer, on_event, position="before", temp_dir=temp_dir, caps=caps, emit=emit)
-            if case.separator_page == "each_copy" and case.copies <= 1:
-                # 份数只有 1 时“份与份之间”没有落点，静默跳过会让人以为属性没生效
-                emit("提示：分隔页=份数之间，但份数为 1，份与份之间不会产生分隔页；"
-                     "如需分隔页请把份数改为 2 以上，或把分隔页改成“前/后”。")
+            # 分隔页走驱动硬件分隔页（纸张→输出→分隔页），不再由软件额外打一张 PDF：
+            # 驱动只有“作业之间/份数之间”两种，设置后由打印机插入分隔页，设置动作
+            # 已在步骤 1 的驱动属性页里完成（见 driver_ui.separator_attrs）。
+            if case.separator_page in {"job", "copies"}:
+                where = "作业之间" if case.separator_page == "job" else "份数之间"
+                emit(f"分隔页=驱动硬分隔页（{where}）：已写入“打印首选项→纸张→输出”，由打印机插入分隔页。")
+                if case.separator_page == "copies" and case.copies <= 1:
+                    # 份数只有 1 时“份与份之间”没有落点，静默跳过会让人以为属性没生效
+                    emit("提示：分隔页=份数之间，但份数为 1，份与份之间不会产生分隔页；"
+                         "如需分隔页请把份数改为 2 以上，或改用“作业之间”。")
 
             # 步骤 2-3/4：打开文档 → 选择驱动 → 按用例属性下发（在 submit 内逐步汇报）
-            job_case = replace(case, copies=1) if each_copy_mode else case
-            if each_copy_mode:
-                emit(f"分隔页=份数之间：将按 {case.copies} 份逐份下发，份与份之间插入分隔页。")
+            job_case = case
             emit(f"步骤 2/4：打开打印文档 {source_path.name}")
             emit(f"步骤 3/4：选择打印机 {printer} 并按用例属性下发")
             baseline = {job.job_id for job in self.spooler.get_jobs(printer)}
@@ -343,12 +342,6 @@ class PrintRunner:
             finally:
                 if watcher is not None:
                     watcher.stop()
-
-            if each_copy_mode and result.status != CaseStatus.STOPPED:
-                self._print_remaining_copies(case, printer, on_event, temp_dir, source_path, caps, emit)
-
-            if case.separator_page in {"after", "both"} and result.status != CaseStatus.STOPPED:
-                self._print_separator_page(case, printer, on_event, position="after", temp_dir=temp_dir, caps=caps, emit=emit)
 
             emit("步骤 4/4：还原驱动默认设置（在 finally 中执行）")
 
@@ -561,53 +554,3 @@ class PrintRunner:
             result.status = CaseStatus.TIMEOUT_QUEUED
             result.message = f"作业 #{job.job_id} 仍在队列中，等待超过监控窗口；请检查打印机面板及队列。"
         push()
-
-    def _print_separator_page(self, case: PrintCase, printer: str, on_event: Callable[[str, object], None], position: str, temp_dir: Path, caps=None, emit=None) -> None:
-        """在主作业之前/之后插打一张分隔页；分隔页失败只记录，不影响主用例状态。"""
-        try:
-            sep_pdf = create_case_separator_pdf(case, printer, temp_dir)
-            sep_case = PrintCase(
-                case_id=f"{case.case_id}-{position}",
-                enabled=True,
-                file_path=str(sep_pdf),
-                paper=case.paper if case.paper.lower() not in {"auto", "mixed"} else "A4",
-                color="monochrome",
-                duplex="simplex",
-                scaling="fit",
-                bin=case.separator_bin,
-            )
-            sep_case.resolved_path = sep_pdf
-            label = {"before": "前置", "after": "后置"}.get(position, position)
-            emit(f"正在打印{label}分隔页：{sep_pdf.name}")
-            # 分隔页要求单面黑白：为分隔页单独设置驱动属性（结束后恢复到主用例属性）
-            sep_restore = None
-            try:
-                sep_restore = self.driver_applier(printer, sep_case, caps=caps, log=emit)
-            except DriverUiError as sep_ds_error:
-                emit(f"分隔页驱动属性设置失败，按当前驱动默认设置打印分隔页：{sep_ds_error}")
-            try:
-                self._submit_case(printer, sep_case, sep_pdf, emit, temp_dir)
-                emit(f"{label}分隔页已提交打印。")
-            finally:
-                if sep_restore is not None:
-                    try:
-                        sep_restore()
-                    except Exception as restore_error:  # noqa: WPS420
-                        emit(f"分隔页驱动设置恢复失败：{restore_error}")
-        except Exception as sep_error:
-            emit(f"分隔页打印失败（不影响主用例）：{sep_error}")
-
-    def _print_remaining_copies(self, case: PrintCase, printer: str, on_event: Callable[[str, object], None], temp_dir: Path, source_path: Path, caps=None, emit=None) -> None:
-        """分隔页=份数之间：逐份下发剩余份数，份与份之间插入分隔页。单份失败只记录，不中断。"""
-        for index in range(2, case.copies + 1):
-            if self.stop_event.is_set():
-                emit("收到停止请求，剩余份数不再下发。")
-                break
-            try:
-                self._print_separator_page(case, printer, on_event, position=f"第{index}份前", temp_dir=temp_dir, caps=caps, emit=emit)
-                one = replace(case, copies=1)
-                emit(f"正在下发第 {index}/{case.copies} 份")
-                self._submit_case(printer, one, source_path, emit, temp_dir)
-                emit(f"第 {index}/{case.copies} 份已提交打印。")
-            except Exception as copy_error:
-                emit(f"第 {index} 份下发失败（不影响已完成部分）：{copy_error}")

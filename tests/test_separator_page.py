@@ -225,3 +225,47 @@ def test_apply_action_verifies_target_text_for_index_action():
     action = Action("纸张", "纸张来源", "combo_index", 2, "DefaultSource", 259, "纸盒1")
     assert _apply_action(window, action) is True
     assert source.selected == "纸盒1"
+
+
+# ---------- 用例“分隔页”列 → 驱动“纸张→输出” ----------
+
+def test_separator_attrs_map_to_driver_output_group(tmp_path):
+    """分隔页=作业之间/份数之间 落到驱动“输出模式 + 分隔页 + 分隔页纸张来源”。"""
+    from printcase.driver_ui import separator_attrs
+    from printcase.models import PrintCase
+
+    case = PrintCase(case_id="TC-SEP", enabled=True, file_path="a.docx",
+                     separator_page="job", bin="纸盒1", separator_bin="纸盒2")
+    attrs = [(item.label, item.value) for item in separator_attrs(case)]
+    assert attrs == [
+        ("输出模式", "分隔页"),
+        ("分隔页", "作业之间"),
+        ("分隔页（OHP插页）纸张来源", "纸盒2"),
+    ]
+    # 份数之间 同理；不填分隔页纸张来源时不覆盖驱动里的那一项
+    case.separator_page = "copies"
+    case.separator_bin = ""
+    assert [(i.label, i.value) for i in separator_attrs(case)] == [
+        ("输出模式", "分隔页"), ("分隔页", "份数之间"),
+    ]
+    # 无 → 显式把“输出”切回正常（驱动默认值可能被上一轮留在“分隔页”）
+    case.separator_page = "none"
+    assert [(i.label, i.value) for i in separator_attrs(case)] == [("输出模式", "正常")]
+
+
+def test_separator_attrs_require_concrete_tray():
+    """纸张来源=自动选择时驱动把整组灰化，必须提前报错而不是打开窗口才失败。"""
+    from printcase.driver_ui import DriverUiError, separator_attrs
+    from printcase.models import PrintCase
+
+    case = PrintCase(case_id="TC-SEP", enabled=True, file_path="a.docx", separator_page="job")
+    with pytest.raises(DriverUiError) as info:
+        separator_attrs(case)
+    assert "具体纸盒" in str(info.value)
+
+
+def test_separator_source_attr_uses_driver_label():
+    """模板里的“分隔页（OHP插页）纸张来源”在驱动里那行只叫“纸张来源”。"""
+    from printcase.ui_print import LABEL_ALIASES
+
+    assert LABEL_ALIASES["分隔页（OHP插页）纸张来源"] == "纸张来源"

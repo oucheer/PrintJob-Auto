@@ -20,13 +20,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from printcase import direct_print  # noqa: E402
 from printcase.audit import AuditStore  # noqa: E402
-from printcase.driver_ui import apply_case, close_stale_preferences  # noqa: E402
+from printcase.driver_ui import (  # noqa: E402
+    DriverUiError,
+    apply_case,
+    close_stale_preferences,
+    separator_attrs,
+)
 from printcase.excel_reader import read_cases  # noqa: E402
 from printcase.models import CaseStatus, PrintCase  # noqa: E402
 from printcase.queue_watch import QueueWatcher  # noqa: E402
 from printcase.runlog import RunLog, prune_logs  # noqa: E402
 from printcase.runner import PrintRunner  # noqa: E402
-from printcase.separator import create_case_separator_pdf  # noqa: E402
 from printcase.spooler import WindowsSpooler  # noqa: E402
 from printcase.validator import validate_case  # noqa: E402
 
@@ -81,12 +85,36 @@ def main() -> int:
     cleared = close_stale_preferences(PRINTER)
     check("清理驱动属性页残留", cleared == 0 or cleared > 0, f"清理 {cleared} 项")
 
-    # ---------- 4. 分隔页 ----------
+    # ---------- 4. 分隔页（驱动硬分隔页：只有 作业之间/份数之间） ----------
     with tempfile.TemporaryDirectory(prefix="verify_app_") as tmp:
         tmp_dir = Path(tmp)
-        sep_pdf = create_case_separator_pdf(tc013, PRINTER, tmp_dir)
-        check("生成分隔页 PDF", sep_pdf.exists() and sep_pdf.stat().st_size > 800,
-              f"{sep_pdf.name} {sep_pdf.stat().st_size} 字节")
+        sep_case = PrintCase(
+            case_id="TC-SEP", enabled=True, file_path=str(DOCX), resolved_path=DOCX,
+            printer=PRINTER, separator_page="job", bin="纸盒1", separator_bin="纸盒2",
+        )
+        attrs = [(item.label, item.value) for item in separator_attrs(sep_case)]
+        check("分隔页映射到驱动“输出”分组",
+              attrs == [("输出模式", "分隔页"), ("分隔页", "作业之间"),
+                        ("分隔页（OHP插页）纸张来源", "纸盒2")],
+              "、".join(f"{k}={v}" for k, v in attrs))
+        no_tray = PrintCase(
+            case_id="TC-SEP2", enabled=True, file_path=str(DOCX), resolved_path=DOCX,
+            printer=PRINTER, separator_page="copies",
+        )
+        try:
+            separator_attrs(no_tray)
+            blocked = False
+            detail = "未拦下"
+        except DriverUiError as exc:
+            blocked = True
+            detail = str(exc)[:60]
+        check("分隔页未指定纸盒时拦下（驱动会整组灰化）", blocked, detail)
+        check("分隔页旧取值（前/后/前后）判错",
+              any("分隔页必须为" in e for e in validate_case(
+                  PrintCase(case_id="TC-SEP3", enabled=True, file_path=str(DOCX),
+                            resolved_path=DOCX, separator_page="before", bin="纸盒1"),
+                  {PRINTER}, PRINTER)),
+              "before 不再被接受")
 
         # ---------- 5. PDF 直打通道（重定向到文件，不耗纸） ----------
         out_dir = tmp_dir / "gdi"

@@ -49,7 +49,9 @@ COLORS = {"color", "monochrome"}
 DUPLEX_MODES = {"simplex", "duplex", "duplexlong", "duplexshort"}
 SCALINGS = {"fit", "shrink", "noscale"}
 BORDERLESS_MODES = {"yes", "no"}
-SEPARATOR_MODES = {"none", "before", "after", "both", "each_copy"}
+# 分隔页只认驱动真有的两种（纸张页“输出→分隔页”下拉实测只有 作业之间/份数之间，
+# 没有“前/后/前后”，也没有“无”——关掉它是把“输出”切回“正常”）。
+SEPARATOR_MODES = {"none", "job", "copies"}
 BINDING_LOCATIONS = {"none", "left", "right", "top", "bottom", "longedge", "shortedge"}
 BINDING_METHODS = {"none", "staple", "saddle", "punch", "glue"}
 COLLATE_MODES = {"", "yes", "no"}
@@ -120,11 +122,14 @@ def validate_case(case: PrintCase, available_printers: set[str], fallback_printe
     if case.borderless.lower() not in BORDERLESS_MODES:
         errors.append("无边距必须为 yes / no")
     if case.separator_page.lower() not in SEPARATOR_MODES:
-        errors.append("分隔页必须为 none / before / after / both / each_copy（份数之间）")
+        errors.append("分隔页必须为 无 / 作业之间 / 份数之间（与驱动“纸张→输出→分隔页”的实际选项一致）")
     if case.separator_bin and ("," in case.separator_bin or "\n" in case.separator_bin or "\r" in case.separator_bin):
         errors.append("分隔页纸张来源不能包含逗号或换行")
     if case.separator_bin and case.separator_page.lower() == "none":
         errors.append("未启用分隔页时不能指定“分隔页纸张来源”（该字段在分隔页=无 时为灰化状态）")
+    if case.separator_page.lower() in {"job", "copies"} and not str(case.bin or "").strip():
+        errors.append("分隔页=作业之间/份数之间 需要先把“纸盒”列指定为具体纸盒（纸盒1/纸盒2）："
+                      "纸张来源为“自动选择”时驱动会把“输出/分隔页”整组灰化，设置不进去")
     if case.binding_location.lower() not in BINDING_LOCATIONS:
         errors.append("装订位置必须为 none / left / right / top / bottom / longedge / shortedge")
     if case.binding_method.lower() not in BINDING_METHODS:

@@ -74,7 +74,7 @@ class PrintCase:
         if self.borderless == "yes":
             parts.append("无边距")
         if self.separator_page != "none":
-            label = {"before": "前", "after": "后", "both": "前后", "each_copy": "份间"}.get(self.separator_page, self.separator_page)
+            label = {"job": "作业之间", "copies": "份数之间"}.get(self.separator_page, self.separator_page)
             parts.append(f"分隔页:{label}")
         if self.separator_bin:
             parts.append(f"分隔页纸盒:{self.separator_bin}")
